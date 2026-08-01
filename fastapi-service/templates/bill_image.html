@@ -1,0 +1,106 @@
+<!--
+  Compact bill layout used ONLY for the image format (see documents/renderer.py).
+
+  Design constraints, in order of importance:
+  - Read comfortably in a WhatsApp chat bubble without zooming, so: narrow page,
+    large-ish type, few columns, high contrast.
+  - Fixed page height because xhtml2pdf cannot auto-size a page; the renderer
+    crops the unused tail afterwards, so trailing white space here is harmless.
+  - English only, by decision: official documents stay English even when the
+    owner talks to the assistant in Urdu or Roman Urdu.
+
+  Two xhtml2pdf quirks drive the CSS below, both found by rendering and looking:
+  - Padding on <body> is ignored, so page inset comes from `@page { margin }`.
+  - Block margins render much looser than in a browser, so spacing is set with
+    small explicit values rather than relying on defaults.
+-->
+<html>
+<head>
+<style>
+  @page { size: 100mm 320mm; margin: 5mm; }
+  body { font-family: Helvetica, sans-serif; font-size: 10px; color: #1a1a1a; }
+
+  .business { font-size: 16px; font-weight: bold; margin: 0; padding: 0; }
+  .doc-line { color: #777; font-size: 9px; margin: 1px 0 0 0; padding: 0; }
+
+  table.party { width: 100%; border-collapse: collapse; margin: 8px 0 0 0; }
+  table.party td { background: #f4f4f4; padding: 6px 8px; }
+  .party-name { font-weight: bold; font-size: 11px; }
+  .party-phone { color: #777; font-size: 9px; }
+
+  table.items { width: 100%; border-collapse: collapse; margin: 10px 0 0 0; }
+  table.items th {
+    text-align: left; font-size: 8px; color: #777; font-weight: normal;
+    border-bottom: 1px solid #d8d8d8; padding: 0 0 3px 0;
+  }
+  table.items td { padding: 4px 0; border-bottom: 1px solid #f0f0f0; }
+  .num { text-align: right; }
+
+  table.totals { width: 100%; border-collapse: collapse; margin: 8px 0 0 0; }
+  table.totals td { padding: 2px 0; color: #777; }
+  table.totals td.val { text-align: right; color: #1a1a1a; }
+  table.totals tr.grand td {
+    border-top: 1.5px solid #1a1a1a; padding-top: 5px;
+    font-weight: bold; font-size: 12px; color: #1a1a1a;
+  }
+</style>
+</head>
+<body>
+  <div class="business">{{ business_name }}</div>
+  <div class="doc-line">
+    {% if invoice_no %}Invoice #{{ invoice_no }}{% elif receipt_no %}Receipt #{{ receipt_no }}{% endif %} &middot; {{ date }}
+  </div>
+
+  <!-- A single-cell table rather than a padded <div>: xhtml2pdf renders the
+       background reliably on table cells, but leaves gaps between stacked
+       divs that made this look like two separate grey bands. -->
+  <table class="party">
+    <tr><td>
+      <span class="party-name">{{ customer_name }}</span>
+      {% if customer_phone %}<br/><span class="party-phone">{{ customer_phone }}</span>{% endif %}
+    </td></tr>
+  </table>
+
+  {% if line_items %}
+  <table class="items">
+    <thead>
+      <tr>
+        <th width="46%">Item</th>
+        <th width="12%" class="num">Qty</th>
+        <th width="21%" class="num">Rate</th>
+        <th width="21%" class="num">Amount</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in line_items %}
+      <tr>
+        <td>{{ item.item_name }}</td>
+        <td class="num">{{ item.quantity }}</td>
+        <td class="num">{{ item.rate }}</td>
+        <td class="num">{{ item.amount }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <table class="totals">
+    {% if subtotal %}
+    <tr><td>Subtotal</td><td class="val">{{ currency_code }} {{ subtotal }}</td></tr>
+    {% endif %}
+    {% if amount %}
+    <tr><td>Amount Paid</td><td class="val">{{ currency_code }} {{ amount }}</td></tr>
+    {% endif %}
+    {% if payment_method %}
+    <tr><td>Method</td><td class="val">{{ payment_method }}</td></tr>
+    {% endif %}
+    {% if amount_received %}
+    <tr><td>Received</td><td class="val">{{ currency_code }} {{ amount_received }}</td></tr>
+    {% endif %}
+    <tr class="grand">
+      <td>Balance</td>
+      <td class="val">{{ currency_code }} {{ balance_after }}</td>
+    </tr>
+  </table>
+</body>
+</html>

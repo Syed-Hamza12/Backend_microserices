@@ -1,0 +1,37 @@
+<html>
+<head>
+<style>
+  body { font-family: Helvetica, sans-serif; font-size: 12px; color: #222; }
+  h1 { font-size: 18px; margin-bottom: 0; }
+  .muted { color: #666; }
+  table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+  th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+  th { background: #f2f2f2; }
+  .totals { margin-top: 16px; }
+</style>
+</head>
+<body>
+  <h1>{{ business_name }} — Report</h1>
+  <div class="muted">Period: {{ date_from }} — {{ date_to }}</div>
+
+  <table class="totals">
+    <tr><td>Total Sales</td><td>{{ currency_code }} {{ total_sales }}</td></tr>
+    <tr><td>Total Payments</td><td>{{ currency_code }} {{ total_payments }}</td></tr>
+  </table>
+
+  <table>
+    <thead>
+      <tr><th>Customer</th><th>Sales</th><th>Payments</th></tr>
+    </thead>
+    <tbody>
+      {% for row in customer_rows %}
+      <tr>
+        <td>{{ row.customer_name }}</td>
+        <td>{{ currency_code }} {{ row.sales }}</td>
+        <td>{{ currency_code }} {{ row.payments }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>
