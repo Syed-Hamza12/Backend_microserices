@@ -833,6 +833,33 @@ class ConfirmDraftDocumentView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+        # An invoice/receipt has no date range — it needs a specific entry,
+        # and the model is never asked for one (see
+        # apps.agent.capabilities.find_latest_entry): the same "most recent
+        # matching entry" resolution the auto-execute path uses. Missing
+        # this was a real bug — /documents/send/ requires target_id for
+        # these two types and this view never supplied one, so tapping
+        # Confirm & Send on a fallback invoice/receipt card always 400'd.
+        target_id = None
+        doc_type = draft["doc_type"]
+        if doc_type in ("invoice", "receipt"):
+            if customer is None:
+                _release_draft_claim(message)
+                return Response(
+                    {"success": False, "error": {"code": "CUSTOMER_NOT_MATCHED", "message": "Customer not found."}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            entry_type = "sale" if doc_type == "invoice" else "payment"
+            entry = document_services.resolve_latest_entry_for_customer(business, customer, entry_type)
+            if entry is None:
+                _release_draft_claim(message)
+                kind = "sale" if entry_type == "sale" else "payment"
+                return Response(
+                    {"success": False, "error": {"code": "NOT_FOUND", "message": f"{customer.name} has no {kind} on record yet."}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            target_id = entry.id
+
         return Response(
             {
                 "success": True,
@@ -841,7 +868,8 @@ class ConfirmDraftDocumentView(APIView):
                     # The app takes these straight to /documents/send/ or
                     # /documents/render/, so one pipeline builds every document.
                     "document_request": {
-                        "doc_type": draft["doc_type"],
+                        "doc_type": doc_type,
+                        "target_id": target_id,
                         "customer_id": customer.id if customer else None,
                         "date_from": date_from.isoformat() if date_from else None,
                         "date_to": date_to.isoformat() if date_to else None,

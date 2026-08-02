@@ -1,4 +1,5 @@
 from decimal import Decimal
+from unittest import mock
 
 from django.test import TestCase
 from django.utils import timezone
@@ -91,6 +92,17 @@ class PlannerResolutionTests(TestCase):
             business=self.business, name="Ali", phone="923001112222",
             opening_balance=Decimal("0"), current_balance=Decimal("0"),
         )
+        # A stored gateway_session_id only means a session was created at
+        # some point, not that it's live right now — resolve time checks the
+        # gateway directly (see capabilities._resolve_send_whatsapp_document).
+        # Tests that want the "actually connected" happy path mock this;
+        # test_a_stale_session_id_still_yields_a_clarification below covers
+        # the case that motivated the check.
+        patcher = mock.patch(
+            "apps.whatsapp.gateway_client.get_status", return_value={"status": "CONNECTED"}
+        )
+        self.mock_get_status = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _reply(self, **draft_document):
         return {"text": "...", "draft_document": {"doc_type": "statement", "summary": "s", **draft_document}}
@@ -138,6 +150,26 @@ class PlannerResolutionTests(TestCase):
         result = plan_from_reply(self.business, self.conversation, self.message, reply)
         self.assertIsInstance(result, Clarification)
 
+    def test_a_stale_session_id_still_yields_a_clarification(self):
+        # The real bug report this guards against: the owner unlinked
+        # WhatsApp from their phone's own Linked Devices menu, which ends
+        # the session on the gateway side without ever clearing
+        # business.gateway_session_id in Django — so the field alone is not
+        # proof of a live connection, only a live status check is.
+        self.mock_get_status.return_value = {"status": "DISCONNECTED"}
+        reply = self._reply(customer_id=self.customer.id)
+        result = plan_from_reply(self.business, self.conversation, self.message, reply)
+        self.assertIsInstance(result, Clarification)
+        self.assertIn("WhatsApp", result.message)
+
+    def test_gateway_unreachable_yields_a_clarification_not_a_crash(self):
+        from apps.whatsapp.gateway_client import GatewayError
+
+        self.mock_get_status.side_effect = GatewayError(503, "GATEWAY_UNREACHABLE", "down")
+        reply = self._reply(customer_id=self.customer.id)
+        result = plan_from_reply(self.business, self.conversation, self.message, reply)
+        self.assertIsInstance(result, Clarification)
+
 
 class ExecutePlanTests(TestCase):
     """The Executor: runs a resolved plan, creates/updates one AgentGoal,
@@ -158,6 +190,11 @@ class ExecutePlanTests(TestCase):
         plan = Plan.objects.create(name="Pro", price_pkr=Decimal("1000"))
         PlanFeature.objects.create(plan=plan, feature_key="whatsapp_send", enabled=True)
         Subscription.objects.create(business=self.business, plan=plan, status="active", started_at=timezone.now())
+        patcher = mock.patch(
+            "apps.whatsapp.gateway_client.get_status", return_value={"status": "CONNECTED"}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_a_fully_resolved_statement_send_queues_a_delivery_and_job(self):
         reply = {"text": "...", "draft_document": {"doc_type": "statement", "summary": "s", "customer_id": self.customer.id}}
@@ -261,6 +298,11 @@ class InvoiceLatestEntryChainTests(TestCase):
         plan = Plan.objects.create(name="Pro", price_pkr=Decimal("1000"))
         PlanFeature.objects.create(plan=plan, feature_key="whatsapp_send", enabled=True)
         Subscription.objects.create(business=self.business, plan=plan, status="active", started_at=timezone.now())
+        patcher = mock.patch(
+            "apps.whatsapp.gateway_client.get_status", return_value={"status": "CONNECTED"}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_resolves_the_latest_sale_with_no_entry_id_given(self):
         reply = {"text": "...", "draft_document": {"doc_type": "invoice", "summary": "s", "customer_id": self.customer.id}}

@@ -4,11 +4,10 @@ import logging
 from apps.billing.models import Subscription
 from apps.billing.services import refund_feature_usage
 from apps.customers.models import Customer
-from apps.image_info_extractor import gemini_client, matching
+from apps.image_info_extractor import matching
 
 from . import prompt
-from .gemini_chat import call_gemini_chat
-from .groq_client import call_groq
+from .groq_client import call_groq, call_groq_text
 from .models import ChatMessage
 from .serializers import AiReplySerializer
 
@@ -52,10 +51,10 @@ def transliterate_to_roman_urdu(text):
         return text
 
     try:
-        # Gemini for the same reason as [to_urdu_script]: this is the other
-        # direction of the same round trip, and the owner's own dictated words
-        # are what get mangled here.
-        converted = gemini_client.generate_text(
+        # Groq, not Gemini — this is ordinary per-message chat traffic, not
+        # OCR, and Gemini's free-tier quota (20 requests/day) can't carry it.
+        # See call_groq_text's docstring.
+        converted = call_groq_text(
             prompt.TRANSLITERATION_INSTRUCTIONS, text[:MAX_TRANSLITERATE_CHARS]
         )
     except Exception as exc:  # noqa: BLE001 - never lose the owner's words to this
@@ -229,14 +228,17 @@ def to_urdu_script(text):
         return text
 
     try:
-        # Gemini, not Groq. Llama writes Urdu script badly enough to be
-        # unintelligible when spoken: "Mujhe samajh nahi aya" came back as
-        # "موجه سمجه نهين آدا" (Arabic ه for Urdu ھ/ہ, mangled words), and the
-        # ur-PK voice reads that out as noise. Gemini returns
-        # "مجھے سمجھ نہیں آیا" and even renders English words speakably
-        # ("please" -> "پلیز"), which matters because this text exists only to
-        # be spoken.
-        converted = gemini_client.generate_text(
+        # Groq, not Gemini — moved off Gemini for quota reasons (see
+        # call_groq_text's docstring), even though this is the one call in
+        # this module Gemini was originally added FOR: Llama has a documented
+        # history of writing Urdu script badly enough to be unintelligible
+        # when spoken ("Mujhe samajh nahi aya" came back as "موجه سمجه نهين
+        # آدا" — Arabic ه for Urdu ھ/ہ, mangled words). `has_urdu_script`
+        # below cannot catch that specific failure mode: the mangled output
+        # is still technically in the Urdu/Arabic Unicode block, so it looks
+        # "valid" to that check. If TTS starts sounding like noise again for
+        # Roman Urdu owners, this is the first place to look.
+        converted = call_groq_text(
             prompt.URDU_SCRIPT_INSTRUCTIONS, text[:MAX_TRANSLITERATE_CHARS]
         )
     except Exception as exc:  # noqa: BLE001 - speech is optional, the reply is not
@@ -253,34 +255,35 @@ def to_urdu_script(text):
     return converted
 
 
-def select_model_tier(message_text, language):
-    """Which model answers this turn — three tiers, cost traded off against
-    language quality and reasoning depth.
+#: Appended when a Roman Urdu reply leaked native/Arabic script — a targeted
+#: nudge for the retry, not a generic "try again".
+SCRIPT_LEAK_REMINDER = (
+    "\n\nIMPORTANT: your last reply's \"text\" contained Urdu script. \"text\" for Roman Urdu MUST be "
+    "Latin letters only (e.g. \"Ali ka 5000 ka bill ban gaya\"). Reply again with \"text\" in Latin "
+    "script only."
+)
 
-    `needs_reasoning` recognises bill/edit/document intent in English, Urdu
-    and Roman Urdu alike. Language then overrides intent for two different
-    reasons:
-      - Roman Urdu ALWAYS goes to Gemini, chit-chat included. Groq's Llama
-        models write grammatically-passable but oddly-phrased Roman Urdu;
-        pronunciation/phrasing quality was chosen over Groq's lower per-call
-        cost for this one language (owner decision) — a "low reasoning"
-        Roman Urdu reply is not exempt.
-      - Native Urdu script goes to the Groq reasoning tier regardless of
-        intent, same as before this change: the fast model cannot WRITE
-        Urdu acceptably at all — it once returned "پاپ کا جو 1 ڑڑ خَد 20
-        مۉّد" to a real owner, which is not words. Gemini is not needed here
-        since 70B's Urdu-script output is adequate, only 8B's is not.
+
+def select_model_tier(message_text, language):
+    """Which model answers this turn — two Groq tiers. `needs_reasoning`
+    recognises bill/edit/document intent in English, Urdu and Roman Urdu
+    alike. Language then overrides intent: both Urdu variants go to the
+    reasoning tier (70B) regardless of intent, since the fast model (8B)
+    cannot WRITE Urdu acceptably at all — it once returned "پاپ کا جو 1 ڑڑ
+    خَد 20 مۉّد" to a real owner, which is not words.
+
+    Gemini is not used for chat replies at all — its free-tier quota (20
+    requests/day) can't carry ordinary chat volume; it is reserved for
+    `apps.image_info_extractor.gemini_client.extract_receipt_data` (OCR)
+    only. A Roman Urdu reply that leaks script gets a same-tier retry with a
+    stricter reminder instead (see `generate_reply`), not a different model.
     """
-    if language == "roman_ur":
-        return "gemini"
-    if language == "ur":
+    if language in ("ur", "roman_ur"):
         return "reasoning"
     return "reasoning" if prompt.needs_reasoning(message_text) else "fast"
 
 
 def _call_model(tier, messages):
-    if tier == "gemini":
-        return call_gemini_chat(messages=messages)
     return call_groq(messages=messages, reasoning=(tier == "reasoning"))
 
 
@@ -294,14 +297,28 @@ def generate_reply(*, business, conversation, text, language=None):
     for attempt in range(2):
         try:
             raw = _call_model(tier, messages)
-            reply_data = _parse_and_validate(raw)
-            break
-        except Exception as exc:  # noqa: BLE001 - covers Groq/Gemini errors + bad-shape JSON
-            logger.warning("chat reply attempt %s failed: %s", attempt, exc)
+            candidate = _parse_and_validate(raw)
+        except Exception as exc:  # noqa: BLE001 - covers Groq errors + bad-shape JSON
+            logger.warning("chat reply attempt %s (%s) failed: %s", attempt, tier, exc)
             if attempt == 0:
                 messages = messages[:-1] + [
                     {"role": "user", "content": text + STRICTER_REMINDER}
                 ]
+            continue
+
+        if attempt == 0 and language == "roman_ur" and has_urdu_script(candidate.get("text") or ""):
+            # Groq's Roman Urdu reply leaked native/Arabic script instead of
+            # staying Latin. Retried once, same tier, with a targeted
+            # reminder — no fallback to a different model (Gemini is
+            # reserved for OCR only, see select_model_tier).
+            logger.warning("groq roman_ur reply leaked script, retrying with a stricter reminder")
+            messages = messages[:-1] + [
+                {"role": "user", "content": text + SCRIPT_LEAK_REMINDER}
+            ]
+            continue
+
+        reply_data = candidate
+        break
 
     ai_failed = reply_data is None
     if ai_failed:

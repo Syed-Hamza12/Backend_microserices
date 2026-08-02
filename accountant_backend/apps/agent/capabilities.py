@@ -194,6 +194,27 @@ def _resolve_send_whatsapp_document(business, conversation, have):
         return Clarification("I don't have a document ready to send yet.")
     if not business.gateway_session_id:
         return Clarification("WhatsApp isn't connected for this business yet — connect it in Settings first.")
+
+    # `gateway_session_id` being set only means a session was created at
+    # some point — it does NOT mean the phone is still linked right now.
+    # Unlinking WhatsApp from the phone's own Linked Devices menu ends the
+    # session on the gateway side without ever clearing this field in
+    # Django, so a stale id here previously let the agent believe it could
+    # send when nothing was actually connected. A live status check is the
+    # only way to know for certain immediately before attempting to send —
+    # it is deliberately NOT done anywhere more frequent than this (e.g.
+    # not on every chat turn), so it costs one extra request only when a
+    # send is actually about to happen.
+    from apps.whatsapp import gateway_client
+    from apps.whatsapp.gateway_client import GatewayError
+
+    try:
+        session = gateway_client.get_status(business.gateway_session_id)
+    except GatewayError:
+        return Clarification("WhatsApp isn't connected for this business yet — connect it in Settings first.")
+    if session.get("status") != "CONNECTED":
+        return Clarification("WhatsApp isn't connected for this business yet — connect it in Settings first.")
+
     customer = document_ref.get("_customer")
     if not customer or not customer.phone:
         return Clarification("That customer has no phone number on record.")

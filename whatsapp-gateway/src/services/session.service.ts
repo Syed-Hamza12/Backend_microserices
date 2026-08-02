@@ -304,6 +304,25 @@ async function openSocket(sessionId: string): Promise<void> {
                 touch(session);
                 sockets.delete(sessionId);
                 logger.warn({ sessionId }, "Session logged out from the handset.");
+
+                // Same cleanup unlinkSession() does for an owner-initiated
+                // unlink, now also done here for a phone-initiated one (e.g.
+                // removed from WhatsApp's own Linked Devices menu). Without
+                // this the on-disk creds stay marked "registered" even
+                // though WhatsApp has revoked them, so the next connect()
+                // resumes with those same dead credentials instead of
+                // starting a fresh pairing — Baileys only ever emits a QR
+                // when there is no existing registration to try first. That
+                // produced exactly the observed loop: repeated "Connection
+                // Failure" / "logged out from handset" on every Connect tap,
+                // with no QR ever shown. Fire-and-forget: this must not
+                // block the event handler, and a failed cleanup here still
+                // leaves the session correctly marked UNLINKED for the
+                // owner to retry.
+                const sessionDir = path.join(env.SESSION_PATH, sessionId);
+                rm(sessionDir, { recursive: true, force: true }).catch((err) => {
+                    logger.warn({ err, sessionId }, "Error while deleting session files after phone-side logout.");
+                });
             }
         });
 

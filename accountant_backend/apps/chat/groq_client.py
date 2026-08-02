@@ -50,3 +50,28 @@ def call_groq(*, messages, reasoning=False, response_format_json=True, timeout=2
             logger.warning("groq call failed key_index=%s model=%s error=%s", idx, model, exc)
 
     raise last_error
+
+
+def call_groq_text(instructions: str, text: str) -> str:
+    """Plain text-in/text-out call, for transliteration and speech_text
+    script conversion — the same shape as
+    `apps.image_info_extractor.gemini_client.generate_text`, on Groq instead
+    of Gemini.
+
+    These moved off Gemini entirely (previously the reasoning for using
+    Gemini here at all): Gemini's free-tier quota is only 20 requests/day,
+    and every one of these calls happens on ordinary chat traffic (every
+    dictated message, every Roman Urdu reply's speech_text) — nowhere near
+    OCR's volume. Gemini is now reserved for
+    `apps.image_info_extractor.gemini_client.extract_receipt_data` only.
+
+    Uses the reasoning-tier model (70B), not the fast one: 8B's Urdu output
+    quality is the documented reason it's excluded from Urdu chat replies at
+    all (see `apps.chat.services.select_model_tier`), and that applies here
+    just as much.
+    """
+    return call_groq(
+        messages=[{"role": "user", "content": f"{instructions}\n\n{text}"}],
+        reasoning=True,
+        response_format_json=False,
+    )

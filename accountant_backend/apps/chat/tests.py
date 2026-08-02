@@ -429,15 +429,16 @@ class ModelRoutingTests(TestCase):
 
 
 class ModelTierSelectionTests(TestCase):
-    """select_model_tier is the three-way (8B/70B/Gemini) dispatch. Roman Urdu
-    always goes to Gemini regardless of intent — even "hello" — because Groq's
-    Roman Urdu phrasing/pronunciation was judged worse than the cost of
-    routing chit-chat there too (owner decision, not just a reasoning-depth
-    call)."""
+    """select_model_tier is the two-way (8B/70B) Groq dispatch. Gemini is not
+    used for chat replies at all anymore — its free-tier quota (20
+    requests/day) can't carry ordinary chat volume; it is reserved for
+    apps.image_info_extractor.gemini_client.extract_receipt_data (OCR) only.
+    See ModelFallbackTests for what happens when Groq's Roman Urdu output
+    needs a retry — it stays on Groq, it does not fall back to Gemini."""
 
-    def test_roman_urdu_always_routes_to_gemini(self):
-        self.assertEqual(services.select_model_tier("hello", "roman_ur"), "gemini")
-        self.assertEqual(services.select_model_tier("Ali ka bill banao", "roman_ur"), "gemini")
+    def test_roman_urdu_routes_to_reasoning_by_default(self):
+        self.assertEqual(services.select_model_tier("hello", "roman_ur"), "reasoning")
+        self.assertEqual(services.select_model_tier("Ali ka bill banao", "roman_ur"), "reasoning")
 
     def test_native_urdu_routes_to_reasoning_regardless_of_intent(self):
         self.assertEqual(services.select_model_tier("ہیلو", "ur"), "reasoning")
@@ -446,7 +447,7 @@ class ModelTierSelectionTests(TestCase):
         self.assertEqual(services.select_model_tier("hello", "en"), "fast")
         self.assertEqual(services.select_model_tier("make a bill for Ali", "en"), "reasoning")
 
-    def test_generate_reply_dispatches_roman_urdu_to_gemini(self):
+    def test_generate_reply_never_touches_gemini(self):
         user = User.objects.create_user(username="g@x.com", email="g@x.com", password="pw")
         business = Business.objects.create(owner=user, business_name="Test Shop", language="roman_ur")
         conversation = Conversation.objects.create(business=business)
@@ -454,11 +455,41 @@ class ModelTierSelectionTests(TestCase):
             "text": "Hello ji", "speech_text": None, "draft_bill": None,
             "document_ready": None, "draft_action": None, "draft_document": None,
         })
-        with mock.patch("apps.chat.services.call_gemini_chat", return_value=payload) as mock_gemini, \
-                mock.patch("apps.chat.services.call_groq") as mock_groq:
+        with mock.patch("apps.chat.services.call_groq", return_value=payload) as mock_groq:
             services.generate_reply(business=business, conversation=conversation, text="salam")
-        mock_gemini.assert_called_once()
-        mock_groq.assert_not_called()
+        mock_groq.assert_called_once()
+
+
+class ModelFallbackTests(TestCase):
+    """When Groq leaks native/Arabic script into a Roman Urdu reply, it gets
+    exactly one retry — on Groq itself, with a stricter reminder, never a
+    different model. Gemini is reserved for OCR only (see
+    ModelTierSelectionTests)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="f@x.com", email="f@x.com", password="pw")
+        self.business = Business.objects.create(owner=self.user, business_name="Test Shop", language="roman_ur")
+        self.conversation = Conversation.objects.create(business=self.business)
+
+    def _payload(self, text):
+        return json.dumps({
+            "text": text, "speech_text": None, "draft_bill": None,
+            "document_ready": None, "draft_action": None, "draft_document": None,
+        })
+
+    def test_script_leak_triggers_one_same_tier_retry(self):
+        leaked = self._payload("پاپ کا بل تیار ہے")  # Urdu script leaked into a roman_ur reply
+        clean = self._payload("Pap ka bill taiyar hai")
+        with mock.patch("apps.chat.services.call_groq", side_effect=[leaked, clean]) as mock_groq:
+            reply = services.generate_reply(business=self.business, conversation=self.conversation, text="bill banao")
+        self.assertEqual(mock_groq.call_count, 2)
+        self.assertEqual(reply.text, "Pap ka bill taiyar hai")
+
+    def test_a_clean_reply_is_accepted_on_the_first_attempt(self):
+        clean = self._payload("Pap ka bill taiyar hai")
+        with mock.patch("apps.chat.services.call_groq", return_value=clean) as mock_groq:
+            services.generate_reply(business=self.business, conversation=self.conversation, text="bill banao")
+        mock_groq.assert_called_once()
 
 
 class HistoryReplayTests(TestCase):
@@ -526,7 +557,8 @@ class SafeDocumentAutoSendTests(TestCase):
                 "date_from": None, "date_to": None, "summary": "Pap ka poora statement",
             },
         })
-        with mock.patch("apps.chat.services.call_groq", return_value=payload):
+        with mock.patch("apps.chat.services.call_groq", return_value=payload), \
+                mock.patch("apps.whatsapp.gateway_client.get_status", return_value={"status": "CONNECTED"}):
             ai_message = services.generate_reply(
                 business=self.business, conversation=self.conversation, text="Pap ko poora statement bhej do"
             )
