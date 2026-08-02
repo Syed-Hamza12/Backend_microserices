@@ -1,42 +1,190 @@
+<!--
+  Matches the reference "Hamza buisness" invoice design (navy icon badges,
+  Billed To box, dark item table, boxed thank-you frame, bold Total bar,
+  Amount in Words, Page X of Y footer).
+
+  xhtml2pdf-safe patterns used throughout (proven against real render tests
+  on this project's statement.html fix):
+  - No float, no display:inline-block — table-based layout only.
+  - No rowspan/colspan mixed with many-column tables (a known source of
+    column-width miscalculation in this renderer) — every table here is
+    either a single-row/single-column wrapper, or a simple flat grid.
+  - Icon badges are pre-rendered PNGs embedded as base64 data URIs, not
+    SVG or an icon font — xhtml2pdf's SVG support is unreliable and no
+    icon font is loaded anywhere in this pipeline.
+  - Page numbering uses pisa's own <pdf:pagenumber/>/<pdf:pagecount/> tags
+    (CSS counters are not reliably supported by xhtml2pdf).
+-->
 <html>
 <head>
 <style>
-  body { font-family: Helvetica, sans-serif; font-size: 12px; color: #222; }
-  h1 { font-size: 18px; margin-bottom: 0; }
-  .muted { color: #666; }
-  table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-  th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
-  th { background: #f2f2f2; }
-  .totals { margin-top: 16px; width: 300px; float: right; }
-  .totals td { border: none; padding: 3px 8px; }
+  @page { margin: 26px 30px; }
+  body { font-family: Helvetica, sans-serif; font-size: 12px; color: #1a2332; }
+
+  .header { width: 100%; }
+  .header td { vertical-align: top; }
+  .business-name { font-size: 24px; font-weight: bold; color: #1a2332; border-bottom: 2px solid #1a2332; padding-bottom: 6px; }
+  .doc-title { font-size: 30px; font-weight: bold; color: #1a2332; text-align: right; }
+
+  .badge { width: 22px; height: 22px; }
+  table.contact-table { margin-top: 12px; border-collapse: collapse; }
+  table.contact-table td { padding: 3px 0; font-size: 11px; color: #333; vertical-align: middle; }
+  table.contact-table td.icon-cell { width: 30px; }
+
+  table.meta-table { margin-top: 12px; border-collapse: collapse; }
+  table.meta-table td { padding: 2px 0; font-size: 11px; }
+  .meta-label { color: #333; padding-right: 10px; }
+  .meta-sep { padding-right: 10px; }
+
+  table.billed-to { width: 100%; background: #f4f5f6; border: 1px solid #e5e6e8; border-collapse: collapse; margin-top: 20px; }
+  table.billed-to td { padding: 14px 16px; vertical-align: middle; }
+  /* vertical-align:middle on the row isn't reliably honored against a
+     taller sibling cell in xhtml2pdf — top-padding the icon cell by hand
+     to visually center the (fixed-size) badge against the ~70px-tall
+     text block next to it gets a consistent result instead. */
+  table.billed-to td.billed-icon { width: 56px; padding-top: 34px; }
+  .billed-tag { background: #1a2332; color: #fff; font-size: 10px; font-weight: bold; padding: 3px 10px; }
+  .billed-name { font-size: 15px; font-weight: bold; margin-top: 6px; }
+  .billed-phone { color: #333; font-size: 11px; margin-top: 3px; }
+
+  table.doc-frame { width: 100%; border-collapse: collapse; margin-top: 18px; }
+  table.doc-frame td.frame-cell { border: 1px solid #e5e6e8; padding: 0; }
+
+  table.items { width: 100%; border-collapse: collapse; }
+  table.items th { background: #1a2332; color: #fff; text-align: left; padding: 8px 10px; font-size: 11px; }
+  table.items th.num { text-align: right; }
+  table.items td { padding: 8px 10px; border-bottom: 1px solid #e5e6e8; font-size: 12px; }
+  table.items td.num { text-align: right; }
+
+  /* An empty <div style="height:Npx"> does not reliably hold its height in
+     xhtml2pdf (same lesson as bill_image.html's fixed-@page-height note) —
+     a table cell with an explicit height does. */
+  table.frame-spacer-table td { height: 60px; }
+  .thank-you { text-align: center; font-style: italic; color: #333; font-size: 12px; padding-bottom: 16px; }
+
+  table.totals { margin-top: 18px; margin-left: auto; width: 320px; border-collapse: collapse; }
+  table.totals td { padding: 7px 10px; font-size: 12px; border-bottom: 1px solid #e5e6e8; }
+  table.totals td:last-child { text-align: right; }
+  table.totals tr.grand-total td { background: #1a2332; color: #fff; font-size: 14px; font-weight: bold; border-bottom: none; }
+
+  .words-block { margin-top: 22px; }
+  .words-label { font-weight: bold; }
+  .words-value { font-style: italic; margin-top: 4px; }
+
+  .notes-block { margin-top: 18px; font-size: 11px; }
+  .notes-block ul { margin: 6px 0 0 16px; padding: 0; }
+
+  .signature { margin-top: 40px; text-align: right; font-size: 11px; }
+  .signature .line { border-top: 1px solid #333; width: 220px; margin-left: auto; padding-top: 4px; }
+
+  .footer { margin-top: 30px; border-top: 1px solid #e5e6e8; padding-top: 10px; text-align: center; font-size: 10px; color: #666; }
 </style>
 </head>
 <body>
-  <h1>{{ business_name }}</h1>
-  <div class="muted">Invoice #{{ invoice_no }} — {{ date }}</div>
+  <table class="header">
+    <tr>
+      <td width="58%">
+        <div class="business-name">{{ business_name }}</div>
+        {% if business_address or business_phone or business_email %}
+        <table class="contact-table">
+          {% if business_address %}
+          <tr>
+            <td class="icon-cell"><img class="badge" src="data:image/png;base64,{{ icon_pin }}"></td>
+            <td>{{ business_address }}</td>
+          </tr>
+          {% endif %}
+          {% if business_phone %}
+          <tr>
+            <td class="icon-cell"><img class="badge" src="data:image/png;base64,{{ icon_phone }}"></td>
+            <td>{{ business_phone }}</td>
+          </tr>
+          {% endif %}
+          {% if business_email %}
+          <tr>
+            <td class="icon-cell"><img class="badge" src="data:image/png;base64,{{ icon_envelope }}"></td>
+            <td>{{ business_email }}</td>
+          </tr>
+          {% endif %}
+        </table>
+        {% endif %}
+      </td>
+      <td width="42%">
+        <div class="doc-title">INVOICE</div>
+        <table class="meta-table" align="right">
+          <tr><td class="meta-label">Invoice No.</td><td class="meta-sep">:</td><td>#{{ invoice_no }}</td></tr>
+          <tr><td class="meta-label">Invoice Date</td><td class="meta-sep">:</td><td>{{ date }}</td></tr>
+          <tr><td class="meta-label">Due Date</td><td class="meta-sep">:</td><td>{{ due_date }}</td></tr>
+        </table>
+      </td>
+    </tr>
+  </table>
 
-  <p><strong>Bill to:</strong> {{ customer_name }} ({{ customer_phone }})</p>
+  <table class="billed-to">
+    <tr>
+      <td class="billed-icon"><img class="badge" src="data:image/png;base64,{{ icon_person }}"></td>
+      <td>
+        <div class="billed-tag">BILLED TO</div>
+        <div class="billed-name">{{ customer_name }}</div>
+        <div class="billed-phone">{{ customer_phone }}</div>
+      </td>
+    </tr>
+  </table>
 
-  <table>
-    <thead>
-      <tr><th>Item</th><th>Qty</th><th>Rate</th><th>Amount</th></tr>
-    </thead>
-    <tbody>
-      {% for item in line_items %}
-      <tr>
-        <td>{{ item.item_name }}</td>
-        <td>{{ item.quantity }}</td>
-        <td>{{ currency_code }} {{ item.rate }}</td>
-        <td>{{ currency_code }} {{ item.amount }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
+  <table class="doc-frame">
+    <tr>
+      <td class="frame-cell">
+        <table class="items">
+          <thead>
+            <tr>
+              <th width="6%">#</th>
+              <th>Item Description</th>
+              <th class="num" width="16%">Qty</th>
+              <th class="num" width="16%">Rate ({{ currency_code }})</th>
+              <th class="num" width="18%">Amount ({{ currency_code }})</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in line_items %}
+            <tr>
+              <td>{{ loop.index }}</td>
+              <td>{{ item.item_name }}</td>
+              <td class="num">{{ item.quantity|commas }}</td>
+              <td class="num">{{ item.rate|commas }}</td>
+              <td class="num">{{ item.amount|commas }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        <table class="frame-spacer-table" width="100%"><tr><td>&nbsp;</td></tr></table>
+        <div class="thank-you">Thank you for your business!</div>
+      </td>
+    </tr>
   </table>
 
   <table class="totals">
-    <tr><td>Subtotal</td><td>{{ currency_code }} {{ subtotal }}</td></tr>
-    <tr><td>Amount Received</td><td>{{ currency_code }} {{ amount_received }}</td></tr>
-    <tr><td><strong>Balance</strong></td><td><strong>{{ currency_code }} {{ balance_after }}</strong></td></tr>
+    <tr><td>Previous Balance</td><td>{{ currency_code }} {{ previous_balance|commas }}</td></tr>
+    <tr><td>Received</td><td>{{ currency_code }} {{ amount_received|commas }}</td></tr>
+    <tr><td>Current Invoice Total (This Invoice)</td><td>{{ currency_code }} {{ subtotal|commas }}</td></tr>
+    <tr class="grand-total"><td>Total</td><td>{{ currency_code }} {{ balance_after|commas }}</td></tr>
   </table>
+
+  <div class="words-block">
+    <div class="words-label">Amount in Words</div>
+    <div class="words-value">{{ amount_in_words }}</div>
+  </div>
+
+  <div class="notes-block">
+    <strong>Notes</strong>
+    <ul>
+      <li>Please check the invoice and inform us in case of any discrepancy within 7 days.</li>
+      <li>This is a computer generated invoice and does not require any signature.</li>
+    </ul>
+  </div>
+
+  <div class="signature">
+    <div class="line">Authorized Signature</div>
+  </div>
+
+  <div class="footer">Thank you for your trust and support! &nbsp;|&nbsp; Page <pdf:pagenumber /> of <pdf:pagecount /></div>
 </body>
 </html>

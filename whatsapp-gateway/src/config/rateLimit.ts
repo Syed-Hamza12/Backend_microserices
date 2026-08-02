@@ -23,7 +23,7 @@ export const DAILY_WINDOW_MS = 86_400_000;
  * over by a retry loop or a stuck reminder job — the complaint that actually
  * gets a number reported.
  */
-export const MAX_MESSAGES_PER_RECIPIENT_PER_HOUR = 6;
+export const MAX_MESSAGES_PER_RECIPIENT_PER_HOUR = 20;
 export const RECIPIENT_WINDOW_MS = 3_600_000;
 
 /**

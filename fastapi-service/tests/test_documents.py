@@ -171,12 +171,17 @@ class TestSafety:
         assert render("invoice", "image", hostile)[0][:4] == b"\x89PNG"
 
     def test_no_external_resource_is_embedded_in_the_pdf(self):
+        # invoice.html legitimately embeds trusted icon badges as base64 data
+        # URIs (see fastapi-service/documents/_icon_assets.py), so the PDF is
+        # expected to contain image XObjects now — those are ours, generated
+        # at build time, never derived from request input. The property this
+        # guards is narrower: the attacker-controlled path in HOSTILE must
+        # never reach the PDF as a live embedded/external resource.
         hostile = dict(BILL, business_name=self.HOSTILE)
         pdf_bytes = render_pdf("invoice", hostile)
         raw = pdf_bytes.decode("latin-1", "ignore")
-        # An interpreted <img> would leave an image XObject behind; escaped
-        # text leaves only font resources.
-        assert "/Subtype /Image" not in raw
+        assert "win.ini" not in raw
+        assert "file:" not in raw
 
     def test_oversized_payload_is_refused(self):
         with pytest.raises(RenderError, match="rendering limit"):

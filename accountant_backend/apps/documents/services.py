@@ -52,8 +52,46 @@ DISPLAY_DATE_FORMAT = "%d %b %Y"
 
 
 def _money(value):
-    """Money as a plain 2-decimal string."""
+    """Money as a plain 2-decimal string.
+
+    Deliberately not comma-grouped: callers (including tests) round-trip this
+    through `Decimal()` to check document arithmetic. Comma grouping for
+    display happens in the template via the `commas` Jinja filter instead.
+    """
     return str(Decimal(value or 0).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+_ONES = [
+    "", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
+    "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen",
+    "Seventeen", "Eighteen", "Nineteen",
+]
+_TENS = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+_SCALES = [(1_000_000_000, "Billion"), (1_000_000, "Million"), (1_000, "Thousand"), (100, "Hundred")]
+
+
+def _int_to_words(n):
+    if n == 0:
+        return "Zero"
+    words = []
+    for value, name in _SCALES:
+        if n >= value:
+            count, n = divmod(n, value)
+            words.append(f"{_int_to_words(count)} {name}")
+    if n < 20:
+        words.append(_ONES[n])
+    elif n < 100:
+        tens, ones = divmod(n, 10)
+        words.append(f"{_TENS[tens]} {_ONES[ones]}".strip())
+    return " ".join(w for w in words if w)
+
+
+def _amount_in_words(value, currency_word="Rupees"):
+    """A money value spelled out for the "Amount in Words" line, e.g.
+    128525.00 -> "One Hundred Twenty Eight Thousand Five Hundred Twenty Five Rupees Only".
+    """
+    whole = int(Decimal(value or 0).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return f"{_int_to_words(whole)} {currency_word} Only"
 
 
 def _quantity(value):
@@ -110,16 +148,29 @@ def build_invoice_payload(entry: ActivityEntry):
             business=business, sale_group_id=entry.sale_group_id, type="payment"
         ).exclude(pk=entry.pk).first()
 
+    amount_received = linked_payment.amount if linked_payment else Decimal(0)
+    balance_after = linked_payment.balance_after if linked_payment else entry.balance_after
+    # What the customer owed before this invoice's sale (and its linked
+    # payment, if any) were applied — printed as "Previous Balance" so the
+    # final Total line reads as an auditable sum, not a number pulled from
+    # nowhere: Previous Balance + Current Invoice Total - Received = Total.
+    previous_balance = Decimal(balance_after) - Decimal(entry.amount) + Decimal(amount_received)
+
     return {
         "business_name": business.business_name,
+        "business_address": business.address,
+        "business_phone": business.phone,
+        "business_email": business.email,
         "currency_code": business.currency_code,
         "invoice_no": entry.id,
         "customer_name": customer.name,
         "customer_phone": customer.phone,
         "date": _display_date(entry.timestamp),
+        "due_date": _display_date(entry.timestamp + timezone.timedelta(days=14)),
         "line_items": line_items,
+        "previous_balance": _money(previous_balance),
         "subtotal": _money(entry.amount),
-        "amount_received": _money(linked_payment.amount) if linked_payment else "0.00",
+        "amount_received": _money(amount_received),
         # The balance AFTER the linked payment, not after the sale alone.
         #
         # `record_sale` timestamps the payment 1ms after the sale, so the sale
@@ -127,7 +178,8 @@ def build_invoice_payload(entry: ActivityEntry):
         # invoice whose arithmetic contradicted itself — "Subtotal 3720,
         # Received 1000, Balance 3720" — overstating what the customer owed on
         # a document they were about to be sent.
-        "balance_after": _money(linked_payment.balance_after if linked_payment else entry.balance_after),
+        "balance_after": _money(balance_after),
+        "amount_in_words": _amount_in_words(balance_after),
     }
 
 
@@ -149,32 +201,78 @@ def build_receipt_payload(entry: ActivityEntry):
 
 def build_statement_payload(business, customer, date_from, date_to):
     start, end = _parse_range(date_from, date_to)
-    entries = ActivityEntry.objects.filter(business=business, customer=customer).order_by("timestamp", "id")
+    entries = (
+        ActivityEntry.objects.filter(business=business, customer=customer)
+        .order_by("timestamp", "id")
+        .prefetch_related("line_items")
+    )
     if start:
         entries = entries.filter(timestamp__gte=start)
     if end:
         entries = entries.filter(timestamp__lte=end)
 
-    rows = [
+    entries = list(entries)
+
+    sale_rows = [
         {
             "date": _display_date(e.timestamp),
-            "type": e.type.title(),
-            "amount": _money(e.amount),
+            "invoice_no": e.id,
             "balance_after": _money(e.balance_after),
+            "line_items": [
+                {
+                    "item_name": li.item_name,
+                    "quantity": _quantity(li.quantity),
+                    "rate": _money(li.rate),
+                    "amount": _money(li.amount),
+                }
+                for li in e.line_items.all()
+            ],
+            "invoice_total": _money(e.amount),
+        }
+        for e in entries
+        if e.type == "sale"
+    ]
+
+    payment_rows = [
+        {
+            "date": _display_date(e.timestamp),
+            "amount": _money(e.amount),
             "note": e.note or "",
         }
         for e in entries
+        if e.type == "payment"
     ]
+
+    total_sales = sum((e.amount for e in entries if e.type == "sale"), Decimal(0))
+    total_received = sum((e.amount for e in entries if e.type == "payment"), Decimal(0))
+    # Balance the customer carried into this statement's period, worked
+    # backwards from the first entry rather than queried separately — a
+    # second, unfiltered query could disagree with the rows actually shown.
+    if entries:
+        first = entries[0]
+        opening_balance = Decimal(first.balance_after) - Decimal(first.amount) * (
+            1 if first.type == "sale" else -1
+        )
+    else:
+        opening_balance = Decimal(customer.current_balance) - total_sales + total_received
 
     return {
         "business_name": business.business_name,
+        "business_address": business.address,
+        "business_phone": business.phone,
+        "business_email": business.email,
         "currency_code": business.currency_code,
         "customer_name": customer.name,
         "customer_phone": customer.phone,
+        "statement_date": _display_date(timezone.localtime(timezone.now())),
         "date_from": date_from or "—",
         "date_to": date_to or "—",
+        "opening_balance": _money(opening_balance),
+        "sale_rows": sale_rows,
+        "payment_rows": payment_rows,
+        "total_sales": _money(total_sales),
+        "total_received": _money(total_received),
         "current_balance": _money(customer.current_balance),
-        "rows": rows,
     }
 
 

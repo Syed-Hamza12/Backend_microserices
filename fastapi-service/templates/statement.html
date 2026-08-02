@@ -1,36 +1,189 @@
 <html>
 <head>
 <style>
-  body { font-family: Helvetica, sans-serif; font-size: 12px; color: #222; }
-  h1 { font-size: 18px; margin-bottom: 0; }
-  .muted { color: #666; }
-  table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-  th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
-  th { background: #f2f2f2; }
+  @page { size: A4; margin: 24px 28px; }
+  body { font-family: Helvetica, sans-serif; font-size: 12px; color: #1a2332; }
+  .header { width: 100%; }
+  .header td { vertical-align: top; }
+  .business-name { font-size: 24px; font-weight: bold; color: #1a2332; border-bottom: 2px solid #1a2332; padding-bottom: 6px; }
+  .doc-title { font-size: 26px; font-weight: bold; color: #1a2332; text-align: right; }
+  .contact-block { margin-top: 8px; font-size: 11px; color: #333; }
+  .meta-block { margin-top: 8px; font-size: 11px; text-align: right; color: #333; }
+  .meta-block div { margin-bottom: 4px; }
+
+  .customer-row { width: 100%; margin-top: 18px; }
+  .customer-box { background: #f4f5f6; border: 1px solid #e5e6e8; padding: 12px 16px; }
+  .customer-box .name { font-size: 13px; }
+  .opening-box { border: 1px solid #e5e6e8; padding: 10px 16px; text-align: center; }
+  .opening-box .label { font-size: 11px; color: #333; }
+  .opening-box .value { font-size: 15px; font-weight: bold; margin-top: 4px; }
+
+  .table-caption { margin-top: 18px; font-size: 10px; color: #666; text-align: right; }
+
+  /* SINGLE FLAT LEDGER TABLE - no nested tables at all.
+     xhtml2pdf's column-width math becomes unreliable with tables
+     nested inside table cells; a single flat table with one row per
+     line item is the layout it renders correctly and consistently.
+     Every <td>/<th> carries an explicit HTML width attribute (not just
+     CSS) because that is what xhtml2pdf actually honors. Widths sum
+     to 540 to match the table's own width. */
+  table.ledger { width: 540px; border-collapse: collapse; margin-top: 4px; }
+  table.ledger th { background: #1a2332; color: #fff; text-align: left; padding: 6px 5px; font-size: 9.5px; }
+  table.ledger th.num { text-align: right; }
+  table.ledger td { padding: 5px 5px; font-size: 9.5px; vertical-align: top; }
+  table.ledger td.num { text-align: right; white-space: nowrap; }
+  table.ledger td.item-name { word-wrap: break-word; color: #333; }
+  table.ledger tr.invoice-first td { border-top: 2px solid #1a2332; padding-top: 8px; }
+  table.ledger tr.invoice-last td { padding-bottom: 8px; }
+  table.ledger td.muted { color: #999; }
+  table.ledger td.bold-total { font-weight: bold; }
+
+  table.payments { width: 400px; border-collapse: collapse; margin-top: 10px; }
+  table.payments th { background: #1a2332; color: #fff; text-align: left; padding: 6px 10px; font-size: 11px; }
+  table.payments th.num { text-align: right; }
+  table.payments td { padding: 6px 10px; font-size: 11px; border-bottom: 1px solid #eee; }
+  table.payments td.num { text-align: right; white-space: nowrap; }
+  table.payments tr.total-row td { font-weight: bold; background: #fafafa; }
+  .payments-label { font-weight: bold; margin-top: 22px; }
+
+  /* xhtml2pdf does not reliably honor margin-left for positioning a
+     narrower table to the right - it can collapse column widths
+     unpredictably. Instead this uses the same wrapper-table alignment
+     pattern already used for the header/customer boxes above, which
+     renders correctly: an outer full-width table with an empty left
+     spacer cell and the summary table's cells in the right cell. */
+  table.summary-wrap { width: 540px; margin-top: 18px; border-collapse: collapse; }
+  table.summary { width: 280px; border-collapse: collapse; }
+  table.summary td { padding: 7px 10px; font-size: 12px; border-bottom: 1px solid #e5e6e8; }
+  table.summary td.num { text-align: right; white-space: nowrap; }
+  table.summary tr.current-balance td { background: #1a2332; color: #fff; font-weight: bold; font-size: 13px; border-bottom: none; }
+
+  .notes-block { margin-top: 18px; font-size: 11px; }
+  .notes-block ul { margin: 6px 0 0 16px; padding: 0; }
+
+  .footer { margin-top: 24px; border-top: 1px solid #e5e6e8; padding-top: 10px; text-align: center; font-size: 10px; color: #666; }
 </style>
 </head>
 <body>
-  <h1>{{ business_name }}</h1>
-  <div class="muted">Statement for {{ customer_name }} ({{ customer_phone }})</div>
-  <div class="muted">Period: {{ date_from }} — {{ date_to }}</div>
+  <table class="header">
+    <tr>
+      <td width="60%">
+        <div class="business-name">{{ business_name }}</div>
+        <div class="contact-block">
+          {% if business_address %}{{ business_address }}<br>{% endif %}
+          {% if business_phone %}Phone: {{ business_phone }}{% endif %}
+          {% if business_phone and business_email %} | {% endif %}
+          {% if business_email %}Email: {{ business_email }}{% endif %}
+        </div>
+      </td>
+      <td width="40%">
+        <div class="doc-title">STATEMENT</div>
+        <div class="meta-block">
+          <div>Statement Date: {{ statement_date }}</div>
+          <div>Period: {{ date_from }} to {{ date_to }}</div>
+        </div>
+      </td>
+    </tr>
+  </table>
 
-  <table>
+  <table class="customer-row">
+    <tr>
+      <td width="65%">
+        <div class="customer-box">
+          <div class="name">Customer Name: <strong>{{ customer_name }}</strong></div>
+          <div>Phone / WhatsApp: {{ customer_phone }}</div>
+        </div>
+      </td>
+      <td width="35%">
+        <div class="opening-box">
+          <div class="label">Opening Balance</div>
+          <div class="value">{{ currency_code }} {{ opening_balance|commas }}</div>
+        </div>
+      </td>
+    </tr>
+  </table>
+
+  <div class="table-caption">Amounts in {{ currency_code }}</div>
+  <table class="ledger">
     <thead>
-      <tr><th>Date</th><th>Type</th><th>Amount</th><th>Balance</th><th>Note</th></tr>
+      <tr>
+        <th width="55">Date</th>
+        <th width="40">Inv #</th>
+        <th width="130">Item</th>
+        <th class="num" width="55">Qty</th>
+        <th class="num" width="60">Rate</th>
+        <th class="num" width="70">Amount</th>
+        <th class="num" width="65">Invoice Total</th>
+        <th class="num" width="65">Balance</th>
+      </tr>
     </thead>
     <tbody>
-      {% for row in rows %}
-      <tr>
-        <td>{{ row.date }}</td>
-        <td>{{ row.type }}</td>
-        <td>{{ currency_code }} {{ row.amount }}</td>
-        <td>{{ currency_code }} {{ row.balance_after }}</td>
-        <td>{{ row.note }}</td>
+      {% for row in sale_rows %}
+      {% for item in row.line_items %}
+      <tr class="{% if loop.first %}invoice-first{% endif %} {% if loop.last %}invoice-last{% endif %}">
+        <td width="55">{% if loop.first %}{{ row.date }}{% endif %}</td>
+        <td width="40">{% if loop.first %}#{{ row.invoice_no }}{% endif %}</td>
+        <td class="item-name" width="130">{{ item.item_name }}</td>
+        <td class="num" width="55">{{ item.quantity|commas }}</td>
+        <td class="num" width="60">{{ item.rate|commas }}</td>
+        <td class="num" width="70">{{ item.amount|commas }}</td>
+        <td class="num bold-total" width="65">{% if loop.first %}{{ row.invoice_total|commas }}{% endif %}</td>
+        <td class="num bold-total" width="65">{% if loop.first %}{{ row.balance_after|commas }}{% endif %}</td>
       </tr>
+      {% endfor %}
       {% endfor %}
     </tbody>
   </table>
 
-  <p><strong>Current balance: {{ currency_code }} {{ current_balance }}</strong></p>
+  {% if payment_rows %}
+  <div class="payments-label">PAYMENTS RECEIVED</div>
+  <table class="payments">
+    <thead>
+      <tr>
+        <th width="90">Date</th>
+        <th class="num" width="110">Amount ({{ currency_code }})</th>
+        <th width="200">Note</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for p in payment_rows %}
+      <tr>
+        <td width="90">{{ p.date }}</td>
+        <td class="num" width="110">{{ p.amount|commas }}</td>
+        <td width="200">{{ p.note }}</td>
+      </tr>
+      {% endfor %}
+      <tr class="total-row">
+        <td width="90">Total Received</td>
+        <td class="num" width="110">{{ total_received|commas }}</td>
+        <td width="200"></td>
+      </tr>
+    </tbody>
+  </table>
+  {% endif %}
+
+  <table class="summary-wrap">
+    <tr>
+      <td width="260"></td>
+      <td width="280">
+        <table class="summary">
+          <tr><td width="154">Opening Balance</td><td class="num" width="126">{{ currency_code }} {{ opening_balance|commas }}</td></tr>
+          <tr><td width="154">Total Sales</td><td class="num" width="126">{{ currency_code }} {{ total_sales|commas }}</td></tr>
+          <tr><td width="154">Total Received</td><td class="num" width="126">{{ currency_code }} {{ total_received|commas }}</td></tr>
+          <tr class="current-balance"><td width="154">Current Balance</td><td class="num" width="126">{{ currency_code }} {{ current_balance|commas }}</td></tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+
+  <div class="notes-block">
+    <strong>Note:</strong>
+    <ul>
+      <li>Please check the statement and inform us in case of any discrepancy within 7 days.</li>
+      <li>This is a computer generated statement and does not require any signature.</li>
+    </ul>
+  </div>
+
+  <div class="footer">Thank you! We value your business.</div>
 </body>
 </html>

@@ -15,12 +15,15 @@ Two rules shape this module:
 """
 
 import io
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pypdfium2 as pdfium
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from PIL import Image
 from xhtml2pdf import pisa
+
+from ._icon_assets import ICONS
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATE_DIR = BASE_DIR / "templates"
@@ -30,10 +33,30 @@ TEMPLATE_DIR = BASE_DIR / "templates"
 # references while building the PDF. Unescaped, an item name containing HTML
 # (say an <img src="file:///..."> read off a photographed bill) would be acted
 # on rather than printed — in a document that then gets sent to a customer.
+def _commas(value):
+    """Groups a plain numeric string's integer part with thousands commas.
+
+    Documents receive figures as plain decimal strings (Django owns the
+    money math and must be able to round-trip them through `Decimal()`);
+    comma grouping is purely presentational, so it lives here rather than
+    in the payload.
+    """
+    try:
+        sign, digits = ("-", str(-Decimal(value))) if Decimal(value) < 0 else ("", str(value))
+        whole, _, frac = digits.partition(".")
+        grouped = f"{int(whole):,}"
+        return f"{sign}{grouped}.{frac}" if frac else f"{sign}{grouped}"
+    except (InvalidOperation, ValueError, TypeError):
+        return value
+
+
 env = Environment(
     loader=FileSystemLoader(str(TEMPLATE_DIR)),
     autoescape=select_autoescape(["html", "xml"]),
 )
+env.filters["commas"] = _commas
+for _name, _b64 in ICONS.items():
+    env.globals[f"icon_{_name}"] = _b64
 
 # A4 layouts, used for the PDF format.
 TEMPLATE_FOR_DOC_TYPE = {

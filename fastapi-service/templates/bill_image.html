@@ -1,18 +1,37 @@
 <!--
-  Compact bill layout used ONLY for the image format (see documents/renderer.py).
+  Compact bill layout used ONLY for the image format (see documents/renderer.py) —
+  shared by invoice AND receipt (IMAGE_TEMPLATE_FOR_DOC_TYPE maps both here), and
+  this is what a customer actually receives by default: invoice/receipt default
+  to format=image (DEFAULT_FORMAT in apps/documents/services.py), not PDF.
 
-  Design constraints, in order of importance:
+  Redesigned to match the "Hamza buisness" reference (navy icon badges, Billed To
+  box, dark item header, bold Total bar, Amount in Words) at this template's
+  existing compact WhatsApp-bubble width, using the same fields invoice.html uses
+  — every invoice-only field is guarded by a conditional block, since receipt
+  payloads don't carry them (business_address/phone/email, due_date,
+  previous_balance, amount_in_words; see apps/documents/services.py's
+  build_receipt_payload).
+
+  Design constraints, in order of importance (unchanged from before):
   - Read comfortably in a WhatsApp chat bubble without zooming, so: narrow page,
     large-ish type, few columns, high contrast.
   - Fixed page height because xhtml2pdf cannot auto-size a page; the renderer
     crops the unused tail afterwards, so trailing white space here is harmless.
   - English only, by decision: official documents stay English even when the
     owner talks to the assistant in Urdu or Roman Urdu.
+  - No page-number footer here (unlike invoice.html's PDF): this is a single
+    autocropped image, not a real paginated document — "Page 1 of 1" would be
+    meaningless on it.
 
-  Two xhtml2pdf quirks drive the CSS below, both found by rendering and looking:
+  xhtml2pdf quirks this file works around (found by rendering and looking,
+  same lessons as invoice.html/statement.html):
   - Padding on <body> is ignored, so page inset comes from `@page { margin }`.
   - Block margins render much looser than in a browser, so spacing is set with
     small explicit values rather than relying on defaults.
+  - An empty <div style="height:Npx"> does not reliably hold its height —
+    use a table cell with an explicit height instead.
+  - vertical-align:middle is not reliably honored against a taller sibling
+    cell — center fixed-size badges with hand-tuned top padding instead.
 -->
 <html>
 <head>
@@ -20,45 +39,70 @@
   @page { size: 100mm 320mm; margin: 5mm; }
   body { font-family: Helvetica, sans-serif; font-size: 10px; color: #1a1a1a; }
 
-  .business { font-size: 16px; font-weight: bold; margin: 0; padding: 0; }
-  .doc-line { color: #777; font-size: 9px; margin: 1px 0 0 0; padding: 0; }
+  .business { font-size: 16px; font-weight: bold; margin: 0; padding: 0; border-bottom: 1.5px solid #1a2332; padding-bottom: 4px; }
+  .doc-line { color: #777; font-size: 9px; margin: 3px 0 0 0; padding: 0; }
 
-  table.party { width: 100%; border-collapse: collapse; margin: 8px 0 0 0; }
-  table.party td { background: #f4f4f4; padding: 6px 8px; }
-  .party-name { font-weight: bold; font-size: 11px; }
-  .party-phone { color: #777; font-size: 9px; }
+  .badge { width: 14px; height: 14px; }
+  table.contact-table { width: 100%; border-collapse: collapse; margin: 6px 0 0 0; }
+  table.contact-table td { padding: 1.5px 0; font-size: 8.5px; color: #333; }
+  table.contact-table td.icon-cell { width: 18px; }
+
+  table.party { width: 100%; border-collapse: collapse; margin: 8px 0 0 0; background: #f4f4f4; }
+  table.party td { padding: 6px 8px; }
+  table.party td.icon-cell { width: 22px; padding-top: 12px; }
+  .billed-tag { background: #1a2332; color: #fff; font-size: 7.5px; font-weight: bold; padding: 2px 6px; }
+  .party-name { font-weight: bold; font-size: 11px; margin-top: 3px; }
+  .party-phone { color: #777; font-size: 9px; margin-top: 2px; }
 
   table.items { width: 100%; border-collapse: collapse; margin: 10px 0 0 0; }
-  table.items th {
-    text-align: left; font-size: 8px; color: #777; font-weight: normal;
-    border-bottom: 1px solid #d8d8d8; padding: 0 0 3px 0;
-  }
-  table.items td { padding: 4px 0; border-bottom: 1px solid #f0f0f0; }
+  table.items th { background: #1a2332; color: #fff; text-align: left; font-size: 8px; font-weight: normal; padding: 4px 4px; }
+  table.items td { padding: 4px; border-bottom: 1px solid #f0f0f0; }
   .num { text-align: right; }
 
   table.totals { width: 100%; border-collapse: collapse; margin: 8px 0 0 0; }
   table.totals td { padding: 2px 0; color: #777; }
   table.totals td.val { text-align: right; color: #1a1a1a; }
   table.totals tr.grand td {
-    border-top: 1.5px solid #1a1a1a; padding-top: 5px;
-    font-weight: bold; font-size: 12px; color: #1a1a1a;
+    background: #1a2332; color: #fff; padding: 6px 4px;
+    font-weight: bold; font-size: 12px;
   }
+  table.totals tr.grand td.val { text-align: right; color: #fff; }
+
+  .words-block { margin-top: 8px; font-size: 8.5px; }
+  .words-label { font-weight: bold; color: #1a1a1a; }
+  .words-value { font-style: italic; color: #555; margin-top: 2px; }
 </style>
 </head>
 <body>
   <div class="business">{{ business_name }}</div>
+
+  {% if business_address or business_phone or business_email %}
+  <table class="contact-table">
+    {% if business_address %}
+    <tr><td class="icon-cell"><img class="badge" src="data:image/png;base64,{{ icon_pin }}"></td><td>{{ business_address }}</td></tr>
+    {% endif %}
+    {% if business_phone %}
+    <tr><td class="icon-cell"><img class="badge" src="data:image/png;base64,{{ icon_phone }}"></td><td>{{ business_phone }}</td></tr>
+    {% endif %}
+    {% if business_email %}
+    <tr><td class="icon-cell"><img class="badge" src="data:image/png;base64,{{ icon_envelope }}"></td><td>{{ business_email }}</td></tr>
+    {% endif %}
+  </table>
+  {% endif %}
+
   <div class="doc-line">
-    {% if invoice_no %}Invoice #{{ invoice_no }}{% elif receipt_no %}Receipt #{{ receipt_no }}{% endif %} &middot; {{ date }}
+    {% if invoice_no %}Invoice #{{ invoice_no }}{% elif receipt_no %}Receipt #{{ receipt_no }}{% endif %} &middot; {{ date }}{% if due_date %} &middot; Due {{ due_date }}{% endif %}
   </div>
 
-  <!-- A single-cell table rather than a padded <div>: xhtml2pdf renders the
-       background reliably on table cells, but leaves gaps between stacked
-       divs that made this look like two separate grey bands. -->
   <table class="party">
-    <tr><td>
-      <span class="party-name">{{ customer_name }}</span>
-      {% if customer_phone %}<br/><span class="party-phone">{{ customer_phone }}</span>{% endif %}
-    </td></tr>
+    <tr>
+      <td class="icon-cell"><img class="badge" src="data:image/png;base64,{{ icon_person }}"></td>
+      <td>
+        <div class="billed-tag">BILLED TO</div>
+        <div class="party-name">{{ customer_name }}</div>
+        {% if customer_phone %}<div class="party-phone">{{ customer_phone }}</div>{% endif %}
+      </td>
+    </tr>
   </table>
 
   {% if line_items %}
@@ -75,9 +119,9 @@
       {% for item in line_items %}
       <tr>
         <td>{{ item.item_name }}</td>
-        <td class="num">{{ item.quantity }}</td>
-        <td class="num">{{ item.rate }}</td>
-        <td class="num">{{ item.amount }}</td>
+        <td class="num">{{ item.quantity|commas }}</td>
+        <td class="num">{{ item.rate|commas }}</td>
+        <td class="num">{{ item.amount|commas }}</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -85,22 +129,32 @@
   {% endif %}
 
   <table class="totals">
+    {% if previous_balance %}
+    <tr><td>Previous Balance</td><td class="val">{{ currency_code }} {{ previous_balance|commas }}</td></tr>
+    {% endif %}
     {% if subtotal %}
-    <tr><td>Subtotal</td><td class="val">{{ currency_code }} {{ subtotal }}</td></tr>
+    <tr><td>Subtotal</td><td class="val">{{ currency_code }} {{ subtotal|commas }}</td></tr>
     {% endif %}
     {% if amount %}
-    <tr><td>Amount Paid</td><td class="val">{{ currency_code }} {{ amount }}</td></tr>
+    <tr><td>Amount Paid</td><td class="val">{{ currency_code }} {{ amount|commas }}</td></tr>
     {% endif %}
     {% if payment_method %}
     <tr><td>Method</td><td class="val">{{ payment_method }}</td></tr>
     {% endif %}
     {% if amount_received %}
-    <tr><td>Received</td><td class="val">{{ currency_code }} {{ amount_received }}</td></tr>
+    <tr><td>Received</td><td class="val">{{ currency_code }} {{ amount_received|commas }}</td></tr>
     {% endif %}
     <tr class="grand">
-      <td>Balance</td>
-      <td class="val">{{ currency_code }} {{ balance_after }}</td>
+      <td>Total</td>
+      <td class="val">{{ currency_code }} {{ balance_after|commas }}</td>
     </tr>
   </table>
+
+  {% if amount_in_words %}
+  <div class="words-block">
+    <div class="words-label">Amount in Words</div>
+    <div class="words-value">{{ amount_in_words }}</div>
+  </div>
+  {% endif %}
 </body>
 </html>
