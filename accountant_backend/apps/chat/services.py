@@ -13,13 +13,46 @@ from .serializers import AiReplySerializer
 
 logger = logging.getLogger(__name__)
 
-FALLBACK_REPLY = {
-    "text": "Sorry, I couldn't process that right now — please try again.",
-    "speech_text": None,
-    "draft_bill": None,
-    "document_ready": None,
-    "draft_document": None,
+# Keyed by the same language codes as Business.language. Previously this was
+# a single hardcoded English dict used regardless of the owner's chosen
+# language — so a Roman Urdu (or Urdu) business hitting this path (model
+# quota exhausted, both attempts failed to parse, etc.) saw an English
+# sentence appear in an otherwise all-Roman-Urdu conversation. `speech_text`
+# is written out by hand rather than derived via `to_urdu_script` for two
+# reasons: this text is fixed and known-correct up front, so there is
+# nothing to gain from a round trip through another model call on a path
+# that already means "something just failed" — and `generate_reply`'s own
+# roman_ur speech_text re-derivation is deliberately skipped when
+# `ai_failed` (see its `and not ai_failed` guard), so leaving speech_text
+# empty here meant Replay had nothing to speak and the app's own "this
+# reply can't be spoken aloud" fallback kicked in — which is the second bug
+# this fixes.
+FALLBACK_REPLIES = {
+    "en": {
+        "text": "Sorry, I couldn't process that right now — please try again.",
+        "speech_text": None,
+    },
+    "ur": {
+        "text": "معذرت، ابھی اس کا جواب نہیں دے سکا — دوبارہ کوشش کریں۔",
+        "speech_text": None,
+    },
+    "roman_ur": {
+        "text": "Maazrat, abhi iska jawab nahi de saka — dobara koshish karein.",
+        "speech_text": "معذرت، ابھی اس کا جواب نہیں دے سکا — دوبارہ کوشش کریں۔",
+    },
 }
+
+
+def _fallback_reply(language):
+    localized = FALLBACK_REPLIES.get(language, FALLBACK_REPLIES["en"])
+    return {
+        "text": localized["text"],
+        "speech_text": localized["speech_text"],
+        "draft_bill": None,
+        "document_ready": None,
+        "draft_action": None,
+        "draft_document": None,
+    }
 
 STRICTER_REMINDER = (
     "\n\nIMPORTANT: your last response did not match the required JSON shape exactly. "
@@ -322,7 +355,7 @@ def generate_reply(*, business, conversation, text, language=None):
 
     ai_failed = reply_data is None
     if ai_failed:
-        reply_data = FALLBACK_REPLY
+        reply_data = _fallback_reply(language)
         # The owner's monthly AI quota was claimed before the call (it has to
         # be, to stay race-free). Every attempt failing means they got nothing,
         # so the slot goes back rather than silently costing them a message.

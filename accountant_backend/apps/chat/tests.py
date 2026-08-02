@@ -366,6 +366,52 @@ class ReplyLanguageTests(TestCase):
             self.assertIn("NOT by the language or script the owner's message", system)
 
 
+class FallbackReplyLocalizationTests(TestCase):
+    """When every model attempt fails (e.g. quota exhausted), the owner still
+    gets a reply — it used to always be a hardcoded English sentence
+    regardless of the business's language, and for Roman Urdu it had no
+    speech_text at all, so tapping "Dobara Sunein" on it hit the app's own
+    "this reply can't be spoken aloud" dead end instead of actually
+    speaking anything."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="fb@x.com", email="fb@x.com", password="pw")
+        self.conversation_owner = None
+
+    def _business(self, language):
+        user = User.objects.create_user(username=f"fb_{language}@x.com", email=f"fb_{language}@x.com", password="pw")
+        business = Business.objects.create(owner=user, business_name="Test Shop", language=language)
+        return business, Conversation.objects.create(business=business)
+
+    def _force_failure(self, business, conversation, language):
+        with mock.patch("apps.chat.services.call_groq", side_effect=Exception("boom")):
+            return services.generate_reply(
+                business=business, conversation=conversation, text="hello", language=language
+            )
+
+    def test_english_business_gets_an_english_fallback(self):
+        business, conversation = self._business("en")
+        reply = self._force_failure(business, conversation, "en")
+        self.assertIn("couldn't process", reply.text)
+
+    def test_roman_urdu_business_gets_a_roman_urdu_fallback_not_english(self):
+        business, conversation = self._business("roman_ur")
+        reply = self._force_failure(business, conversation, "roman_ur")
+        self.assertNotIn("couldn't process", reply.text)
+        self.assertIn("Maazrat", reply.text)
+
+    def test_roman_urdu_fallback_has_a_speakable_speech_text(self):
+        business, conversation = self._business("roman_ur")
+        reply = self._force_failure(business, conversation, "roman_ur")
+        self.assertIsNotNone(reply.speech_text)
+        self.assertTrue(services.has_urdu_script(reply.speech_text))
+
+    def test_urdu_business_gets_native_script_not_english(self):
+        business, conversation = self._business("ur")
+        reply = self._force_failure(business, conversation, "ur")
+        self.assertTrue(services.has_urdu_script(reply.text))
+
+
 class TransliterationTests(TestCase):
     """Android's ur-PK recogniser only emits native Urdu script, so an owner who
     chose Roman Urdu saw their own dictated words in a script they didn't pick."""
