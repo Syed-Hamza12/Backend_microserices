@@ -57,7 +57,23 @@ def _fail(delivery, code, message):
             "message": message,
         },
     )
+    _notify_agent_goal("document_delivery_failed", delivery.id)
     return {"status": "failed", "delivery_id": delivery.id, "error": {"code": code, "message": message}}
+
+
+def _notify_agent_goal(event_type, delivery_id):
+    """Closes out any AgentGoal waiting on this delivery (see
+    apps.agent.goals.GoalManager) — the Verification Layer for an
+    auto-executed document send. A goal is only ever a small minority of
+    deliveries (most sends still come from the manual Send screen or a
+    tap-confirmed draft_bill), so this is a no-op lookup for the rest.
+    Imported here, not at module scope: apps.agent imports apps.documents
+    (via apps.chat's capabilities), and a top-level import would close a
+    cycle back into this module.
+    """
+    from apps.agent.goals import GoalManager
+
+    GoalManager.handle_event(event_type, {"delivery_id": delivery_id})
 
 
 def handle_document_send_job(job_task):
@@ -139,6 +155,7 @@ def handle_document_send_job(job_task):
         delivered_format,
         delivery.byte_size,
     )
+    _notify_agent_goal("document_delivery_accepted", delivery.id)
 
     return {
         "status": "accepted",

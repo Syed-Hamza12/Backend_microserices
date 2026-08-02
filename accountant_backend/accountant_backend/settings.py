@@ -97,6 +97,7 @@ INSTALLED_APPS = [
     'apps.image_info_extractor',
     'apps.notifications',
     'apps.whatsapp',
+    'apps.agent',
 ]
 
 MIDDLEWARE = [

@@ -7,6 +7,7 @@ from apps.customers.models import Customer
 from apps.image_info_extractor import gemini_client, matching
 
 from . import prompt
+from .gemini_chat import call_gemini_chat
 from .groq_client import call_groq
 from .models import ChatMessage
 from .serializers import AiReplySerializer
@@ -252,27 +253,50 @@ def to_urdu_script(text):
     return converted
 
 
+def select_model_tier(message_text, language):
+    """Which model answers this turn — three tiers, cost traded off against
+    language quality and reasoning depth.
+
+    `needs_reasoning` recognises bill/edit/document intent in English, Urdu
+    and Roman Urdu alike. Language then overrides intent for two different
+    reasons:
+      - Roman Urdu ALWAYS goes to Gemini, chit-chat included. Groq's Llama
+        models write grammatically-passable but oddly-phrased Roman Urdu;
+        pronunciation/phrasing quality was chosen over Groq's lower per-call
+        cost for this one language (owner decision) — a "low reasoning"
+        Roman Urdu reply is not exempt.
+      - Native Urdu script goes to the Groq reasoning tier regardless of
+        intent, same as before this change: the fast model cannot WRITE
+        Urdu acceptably at all — it once returned "پاپ کا جو 1 ڑڑ خَد 20
+        مۉّد" to a real owner, which is not words. Gemini is not needed here
+        since 70B's Urdu-script output is adequate, only 8B's is not.
+    """
+    if language == "roman_ur":
+        return "gemini"
+    if language == "ur":
+        return "reasoning"
+    return "reasoning" if prompt.needs_reasoning(message_text) else "fast"
+
+
+def _call_model(tier, messages):
+    if tier == "gemini":
+        return call_gemini_chat(messages=messages)
+    return call_groq(messages=messages, reasoning=(tier == "reasoning"))
+
+
 def generate_reply(*, business, conversation, text, language=None):
     language = language or business.language
     history = _recent_history(conversation, _history_limit(business))
     messages = prompt.build_messages(business, history, text, language=language)
-    # `needs_reasoning` is the real router and now recognises bill/edit intent in
-    # Urdu and Roman Urdu too (it was English-only, so every Urdu request was
-    # misrouted to the fast model). The language check below is a second layer
-    # for a different problem: the fast model cannot WRITE Urdu acceptably — it
-    # returned "پاپ کا جو 1 ڑڑ خَد 20 مۉّد" to a real owner, which is not words.
-    # So even genuinely simple messages go to the larger model when the reply
-    # will be in Urdu or Roman Urdu. Drop this clause if the fast model's Urdu
-    # ever becomes good enough; the intent routing above stands on its own.
-    reasoning = prompt.needs_reasoning(text) or language in ("ur", "roman_ur")
+    tier = select_model_tier(text, language)
 
     reply_data = None
     for attempt in range(2):
         try:
-            raw = call_groq(messages=messages, reasoning=reasoning)
+            raw = _call_model(tier, messages)
             reply_data = _parse_and_validate(raw)
             break
-        except Exception as exc:  # noqa: BLE001 - covers Groq errors + bad-shape JSON
+        except Exception as exc:  # noqa: BLE001 - covers Groq/Gemini errors + bad-shape JSON
             logger.warning("chat reply attempt %s failed: %s", attempt, exc)
             if attempt == 0:
                 messages = messages[:-1] + [
@@ -340,4 +364,52 @@ def generate_reply(*, business, conversation, text, language=None):
             ai_message.speech_text = None
             ai_message.save(update_fields=["text", "speech_text"])
 
+    if not ai_failed:
+        apply_safe_document_send(business, conversation, ai_message, reply_data, language)
+
     return ai_message
+
+
+def apply_safe_document_send(business, conversation, ai_message, reply_data, language):
+    """Auto-executes a `draft_document` request that the agent layer can
+    fully resolve on its own — the extension of `record_drafted_bill`'s
+    "execute now, no tap" pattern to documents. Only reached for doc types
+    the Planner composes for today (invoice/receipt/statement, see
+    `apps.agent.planner._GENERATOR_FOR_DOC_TYPE`); anything else (a report,
+    or a doc type it couldn't resolve) falls through untouched and keeps
+    behaving exactly like the existing tap-confirm `draft_document` flow.
+    """
+    from apps.agent.executor import execute_plan
+    from apps.agent.planner import plan_from_reply
+    from apps.agent.results import Clarification
+
+    plan = plan_from_reply(business, conversation, ai_message, reply_data)
+    if plan is None:
+        return
+
+    if isinstance(plan, Clarification):
+        # The model believed this was resolvable (it named a customer/doc
+        # type) but the agent layer found it wasn't — say so plainly instead
+        # of leaving whatever premature/optimistic text the model wrote.
+        _overwrite_reply_text(ai_message, plan.message, language)
+        return
+
+    outcome = execute_plan(business=business, conversation=conversation, message=ai_message, steps=plan)
+    if outcome.text:
+        _overwrite_reply_text(ai_message, outcome.text, language)
+    if outcome.pending_delivery_id:
+        from apps.documents.models import DocumentDelivery
+
+        ai_message.pending_delivery = DocumentDelivery.objects.filter(pk=outcome.pending_delivery_id).first()
+        ai_message.save(update_fields=["pending_delivery"])
+
+
+def _overwrite_reply_text(ai_message, new_text, language):
+    """Replaces the model's own reply text with one the agent layer wrote
+    after actually resolving/executing the request — the model wrote its
+    version before knowing whether this would auto-execute. Re-derives
+    speech_text the same way the main reply does, so Roman Urdu TTS never
+    speaks stale content the visible text no longer matches."""
+    ai_message.text = new_text
+    ai_message.speech_text = (to_urdu_script(new_text) or None) if language == "roman_ur" else None
+    ai_message.save(update_fields=["text", "speech_text"])

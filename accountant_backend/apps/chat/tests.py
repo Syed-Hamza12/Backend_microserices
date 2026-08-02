@@ -6,6 +6,7 @@ double tap recording a sale twice, and the untrusted-text boundary that keeps
 OCR'd document text from being read as instructions.
 """
 
+import json
 from decimal import Decimal
 from unittest import mock
 
@@ -21,6 +22,7 @@ from .models import ChatMessage, Conversation
 from .prompt import (
     UNTRUSTED_CLOSE,
     build_entry_context,
+    build_messages,
     build_system_prompt,
     needs_reasoning,
     wrap_untrusted,
@@ -416,6 +418,146 @@ class ModelRoutingTests(TestCase):
     def test_english_routing_still_works(self):
         self.assertTrue(needs_reasoning("make a bill for Ali"))
         self.assertFalse(needs_reasoning("hello"))
+
+    def test_document_requests_route_to_the_reasoning_model(self):
+        # Building a statement reads the ledger just like drafting a bill does;
+        # the fast model handled these and asked for a date range it had already
+        # been given, then invented a document_url.
+        self.assertTrue(needs_reasoning("send Ali his full statement on whatsapp"))
+        self.assertTrue(needs_reasoning("pap ka poora statement bhej do"))
+        self.assertTrue(needs_reasoning("پاپ کا پورا اسٹیٹمنٹ بھیج دو"))
+
+
+class ModelTierSelectionTests(TestCase):
+    """select_model_tier is the three-way (8B/70B/Gemini) dispatch. Roman Urdu
+    always goes to Gemini regardless of intent — even "hello" — because Groq's
+    Roman Urdu phrasing/pronunciation was judged worse than the cost of
+    routing chit-chat there too (owner decision, not just a reasoning-depth
+    call)."""
+
+    def test_roman_urdu_always_routes_to_gemini(self):
+        self.assertEqual(services.select_model_tier("hello", "roman_ur"), "gemini")
+        self.assertEqual(services.select_model_tier("Ali ka bill banao", "roman_ur"), "gemini")
+
+    def test_native_urdu_routes_to_reasoning_regardless_of_intent(self):
+        self.assertEqual(services.select_model_tier("ہیلو", "ur"), "reasoning")
+
+    def test_english_still_splits_by_intent(self):
+        self.assertEqual(services.select_model_tier("hello", "en"), "fast")
+        self.assertEqual(services.select_model_tier("make a bill for Ali", "en"), "reasoning")
+
+    def test_generate_reply_dispatches_roman_urdu_to_gemini(self):
+        user = User.objects.create_user(username="g@x.com", email="g@x.com", password="pw")
+        business = Business.objects.create(owner=user, business_name="Test Shop", language="roman_ur")
+        conversation = Conversation.objects.create(business=business)
+        payload = json.dumps({
+            "text": "Hello ji", "speech_text": None, "draft_bill": None,
+            "document_ready": None, "draft_action": None, "draft_document": None,
+        })
+        with mock.patch("apps.chat.services.call_gemini_chat", return_value=payload) as mock_gemini, \
+                mock.patch("apps.chat.services.call_groq") as mock_groq:
+            services.generate_reply(business=business, conversation=conversation, text="salam")
+        mock_gemini.assert_called_once()
+        mock_groq.assert_not_called()
+
+
+class HistoryReplayTests(TestCase):
+    """The model only knows what it already proposed from its own replayed
+    turns. draft_document was left out of that replay, so it proposed a
+    statement, saw no draft in the next turn's history, and told the same owner
+    "taiyar hai", then "ready nahi hai", then "send nahi ho sakta" for one
+    unchanged request."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="h@x.com", email="h@x.com", password="pw")
+        self.business = Business.objects.create(owner=self.user, business_name="Test Shop")
+        self.conversation = Conversation.objects.create(business=self.business)
+
+    def test_a_replayed_ai_turn_still_carries_its_draft_document(self):
+        draft = {"doc_type": "statement", "customer_id": 2, "date_from": None, "date_to": None,
+                 "summary": "Pap ka poora statement"}
+        owner_msg = ChatMessage.objects.create(
+            conversation=self.conversation, sender="owner", text="poora statement bhej do"
+        )
+        ai_msg = ChatMessage.objects.create(
+            conversation=self.conversation, sender="ai", text="Statement taiyar hai", draft_document=draft
+        )
+
+        messages = build_messages(self.business, [owner_msg, ai_msg], "haan bhej do")
+
+        replayed = next(m for m in messages if m["role"] == "assistant")
+        self.assertIn("draft_document", replayed["content"])
+        self.assertIn("Pap ka poora statement", replayed["content"])
+
+
+class SafeDocumentAutoSendTests(TestCase):
+    """End-to-end replay of the Hamza scenario through generate_reply: a
+    fully-resolvable "send my full statement" request must auto-execute with
+    no date-range question, no refusal, and no claimed success before the
+    delivery is actually verified — see apps.agent.executor/goals."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="hz@x.com", email="hz@x.com", password="pw")
+        self.business = Business.objects.create(
+            owner=self.user, business_name="Test Shop", gateway_session_id="sess-1"
+        )
+        self.customer = Customer.objects.create(
+            business=self.business, name="Pap", phone="923001112222",
+            opening_balance=0, current_balance=0,
+        )
+        self.conversation = Conversation.objects.create(business=self.business)
+        from apps.billing.models import Plan, PlanFeature, Subscription
+        from django.utils import timezone as dj_timezone
+
+        plan = Plan.objects.create(name="Pro", price_pkr=1000)
+        PlanFeature.objects.create(plan=plan, feature_key="whatsapp_send", enabled=True)
+        PlanFeature.objects.create(plan=plan, feature_key="ai_chat", enabled=True)
+        Subscription.objects.create(business=self.business, plan=plan, status="active", started_at=dj_timezone.now())
+
+    def test_resolvable_statement_send_auto_executes_with_no_technical_leakage(self):
+        payload = json.dumps({
+            "text": "Pap ka poora statement taiyar kar raha hoon",
+            "speech_text": None,
+            "draft_bill": None,
+            "document_ready": None,
+            "draft_action": None,
+            "draft_document": {
+                "doc_type": "statement", "customer_id": self.customer.id,
+                "date_from": None, "date_to": None, "summary": "Pap ka poora statement",
+            },
+        })
+        with mock.patch("apps.chat.services.call_groq", return_value=payload):
+            ai_message = services.generate_reply(
+                business=self.business, conversation=self.conversation, text="Pap ko poora statement bhej do"
+            )
+
+        # Auto-executed: no draft sitting around waiting for a tap, a delivery
+        # is queued, and the reply never claims delivery already happened.
+        self.assertIsNotNone(ai_message.pending_delivery_id)
+        for leaked_word in ("draft", "JSON", "endpoint", "confirm", "queue"):
+            self.assertNotIn(leaked_word.lower(), ai_message.text.lower())
+        for false_claim in ("bhej diya", "delivered", "has been sent"):
+            self.assertNotIn(false_claim.lower(), ai_message.text.lower())
+
+    def test_no_whatsapp_connected_gives_one_honest_reply_no_fabricated_url(self):
+        self.business.gateway_session_id = None
+        self.business.save(update_fields=["gateway_session_id"])
+        payload = json.dumps({
+            "text": "...", "speech_text": None, "draft_bill": None, "document_ready": None,
+            "draft_action": None,
+            "draft_document": {
+                "doc_type": "statement", "customer_id": self.customer.id,
+                "date_from": None, "date_to": None, "summary": "Pap ka poora statement",
+            },
+        })
+        with mock.patch("apps.chat.services.call_groq", return_value=payload):
+            ai_message = services.generate_reply(
+                business=self.business, conversation=self.conversation, text="Pap ko poora statement bhej do"
+            )
+
+        self.assertIsNone(ai_message.pending_delivery_id)
+        self.assertIn("WhatsApp", ai_message.text)
+        self.assertNotIn("http", ai_message.text.lower())
 
 
 class PromptContainmentTests(TestCase):

@@ -1,6 +1,7 @@
 from django.db import models
 
 from apps.accounts.models import Business
+from apps.documents.models import DocumentDelivery
 
 
 class ChatSyncState(models.Model):
@@ -64,6 +65,14 @@ class ChatMessage(models.Model):
     # apps.chat.serializers.DraftDocumentSerializer. Confirmed by the owner like
     # any other draft; the server builds it from the ledger.
     draft_document = models.JSONField(null=True, blank=True)
+    # Set when this reply auto-executed a safe capability that queued a
+    # WhatsApp send (see apps.agent.executor) — the AI already acted, so this
+    # is not another draft to confirm. The client polls this delivery's status
+    # and appends the outcome as a follow-up plain-text bubble once it
+    # resolves; see apps.agent.goals.GoalManager.handle_event.
+    pending_delivery = models.ForeignKey(
+        DocumentDelivery, on_delete=models.SET_NULL, null=True, blank=True, related_name="chat_messages"
+    )
     # True when this AI turn is the "sorry, I couldn't process that" fallback
     # rather than a real model reply. Kept out of prompt history (see
     # apps.chat.services._recent_history) and lets the app show a retry

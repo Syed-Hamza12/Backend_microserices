@@ -252,14 +252,31 @@ class SendEndpointTests(DocumentTestMixin, APITestCase):
         self.assertTrue(JobTask.objects.filter(pk=data["job_id"], type="document_send").exists())
 
     def test_send_refuses_an_unsupported_format(self):
+        # No doc_type/format combination is actually unsupported today (a
+        # statement image is attempted and falls back to PDF via the
+        # renderer's own over-length substitution, see
+        # apps.documents.services.SUPPORTED_FORMATS) — this now exercises the
+        # one input the serializer itself rejects: an unknown doc_type.
+        self.enable_whatsapp_send()
+        response = self.client.post(
+            "/api/documents/send/",
+            {"doc_type": "brochure", "customer_id": self.customer.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_send_allows_an_explicit_statement_image_request(self):
+        # Statements default to PDF, but an explicit image request is
+        # attempted rather than rejected outright — the renderer substitutes
+        # PDF automatically if it doesn't fit, same mechanism already
+        # governing invoice/receipt.
         self.enable_whatsapp_send()
         response = self.client.post(
             "/api/documents/send/",
             {"doc_type": "statement", "customer_id": self.customer.id, "format": "image"},
             format="json",
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["error"]["code"], "UNSUPPORTED_FORMAT")
+        self.assertEqual(response.status_code, 202, response.content)
 
     def test_send_refuses_when_whatsapp_is_not_connected(self):
         self.enable_whatsapp_send()
@@ -285,7 +302,9 @@ class SendEndpointTests(DocumentTestMixin, APITestCase):
         data = response.json()["data"]
         self.assertEqual(data["invoice"]["default"], "image")
         self.assertEqual(data["statement"]["default"], "pdf")
-        self.assertNotIn("image", data["statement"]["formats"])
+        # Image is offered as an explicit, non-default option now — the owner
+        # can still ask for one, they just aren't steered toward it.
+        self.assertIn("image", data["statement"]["formats"])
 
     def test_render_returns_the_file_itself(self):
         with patch("apps.documents.views.render_document", return_value=(PNG_BYTES, "image")):

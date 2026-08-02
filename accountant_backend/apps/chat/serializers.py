@@ -70,25 +70,34 @@ class DraftActionSerializer(serializers.Serializer):
 
 
 class DraftDocumentSerializer(serializers.Serializer):
-    """An AI-proposed statement or report over an explicit date range.
+    """An AI-proposed document — a statement/report over a date range, or a
+    resend of a customer's existing invoice/receipt (the server finds their
+    latest one; no entry id is expected from the model — see
+    `apps.agent.capabilities.find_latest_entry`).
 
     Distinct from `document_ready`, which requires a URL the model was handed
-    and must never invent. This is a *request* to generate one — the owner
-    confirms it, and the server builds the document from the ledger.
+    and must never invent. This is a *request* to generate one. Whether it
+    executes immediately or waits for an owner tap is decided by
+    `apps.agent.planner`/`apps.chat.services.apply_safe_document_send` based
+    on resolvability — not by anything the model sets here.
 
     Dates stay free-form strings so `apps.sales.business_date` resolves them
     server-side, the same as `draft_bill.date`.
     """
 
-    doc_type = serializers.ChoiceField(choices=["statement", "report"])
+    doc_type = serializers.ChoiceField(choices=["statement", "report", "invoice", "receipt"])
     customer_id = serializers.IntegerField(required=False, allow_null=True)
     date_from = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     date_to = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    # Explicit owner override only ("PDF mein bhejo", "image mein bhejo") —
+    # null/omitted means let the document type's own default decide (see
+    # apps.documents.services.DEFAULT_FORMAT).
+    format = serializers.ChoiceField(choices=["image", "pdf"], required=False, allow_null=True)
     summary = serializers.CharField()
 
     def validate(self, attrs):
-        if attrs["doc_type"] == "statement" and not attrs.get("customer_id"):
-            raise serializers.ValidationError("customer_id is required for a statement.")
+        if attrs["doc_type"] in ("statement", "invoice", "receipt") and not attrs.get("customer_id"):
+            raise serializers.ValidationError(f"customer_id is required for a {attrs['doc_type']}.")
         return attrs
 
 
@@ -113,6 +122,12 @@ class AiReplySerializer(serializers.Serializer):
 
 
 class ChatMessageSerializer(serializers.ModelSerializer):
+    # Set when this reply auto-executed a safe send (see
+    # apps.chat.services.apply_safe_document_send) — the client polls this
+    # delivery's status and appends the outcome itself; there is no draft to
+    # confirm here, unlike draft_bill/draft_action/draft_document.
+    pending_delivery_id = serializers.IntegerField(read_only=True, allow_null=True)
+
     class Meta:
         model = ChatMessage
         fields = [
@@ -126,6 +141,7 @@ class ChatMessageSerializer(serializers.ModelSerializer):
             "document_ready",
             "draft_action",
             "draft_document",
+            "pending_delivery_id",
             "is_error_fallback",
             "timestamp",
             "updated_at",

@@ -7,8 +7,36 @@ from django.utils import timezone
 from django.utils.dateparse import parse_date
 
 from apps.customers.models import Customer
+from apps.sales.business_date import BusinessDateError, resolve as resolve_business_date
 from apps.sales.models import ActivityEntry
 
+ALL_DOC_TYPES = {"invoice", "receipt", "statement", "report"}
+
+# Which formats each document type can be produced in. Mirrors FastAPI's
+# /documents/formats so the app can offer only workable choices rather than
+# discovering a limitation via an error after the owner has tapped Send.
+#
+# Statement/report gained "image" as an explicit-request-only option: the
+# owner may ask for one as an image, and the renderer's own over-length
+# fallback (see `render_document`'s `X-Document-Format` handling) substitutes
+# PDF automatically if it doesn't fit — the same mechanism that already
+# governs invoice/receipt. DEFAULT_FORMAT is unchanged for these two, so
+# nothing changes unless the owner explicitly asks for an image.
+SUPPORTED_FORMATS = {
+    "invoice": ["image", "pdf"],
+    "receipt": ["image", "pdf"],
+    "statement": ["pdf", "image"],
+    "report": ["pdf", "image"],
+}
+
+DEFAULT_FORMAT = {
+    # Bills default to an image: customers read them inline in WhatsApp without
+    # downloading anything. Statements and reports are multi-page by nature.
+    "invoice": "image",
+    "receipt": "image",
+    "statement": "pdf",
+    "report": "pdf",
+}
 
 
 # Presentation helpers.
@@ -264,21 +292,60 @@ def render_document(*, doc_type, output_format, business_id, payload):
     return response.content, delivered_format
 
 
-def queue_invoice_send(business, entry, customer):
-    """Queues an invoice for `entry` to `customer`'s WhatsApp. Returns a dict
-    describing what happened, and never raises.
+def resolve_latest_entry_for_customer(business, customer, entry_type):
+    """The most recent matching entry for a customer, or None.
 
-    Split out of `SendDocumentView` so the chat confirm can reuse the one send
-    pipeline rather than growing a second, subtly different one.
-
-    Every "can't send" case here is a *reason*, not an error: the caller has
-    already recorded the sale on the ledger, and a bill that is saved but not
-    delivered must never look like a bill that failed to save. The owner is
-    told the money is recorded and why the message didn't go, so they can send
-    it by hand.
+    Needed so "send Ali's last invoice" resolves without the owner (or the
+    model) naming a specific entry id — `build_payload_for` otherwise
+    requires an explicit `target_id`.
     """
-    # Imported here rather than at module scope: apps.billing imports back into
-    # documents for its usage reporting, and a top-level import closes that loop.
+    return (
+        ActivityEntry.objects.filter(business=business, customer=customer, type=entry_type)
+        .order_by("-timestamp", "-id")
+        .first()
+    )
+
+
+def resolve_document_request(business, *, doc_type, customer=None, date_from=None, date_to=None, entry=None):
+    """Server-side re-validation shared by `ConfirmDraftDocumentView` (the
+    owner taps to confirm) and `apps.agent.capabilities` (the auto-execute
+    path) — one validation path, not two. Never trusts a date or an id as
+    given; re-resolves everything against real data, the same way
+    `apps.chat.views.build_sale_from_draft` does for a bill draft.
+
+    Raises DocumentError on anything that can't be resolved — every caller
+    turns that into a clarifying question or an honest explanation, never a
+    guess.
+    """
+    if doc_type not in ALL_DOC_TYPES:
+        raise DocumentError("UNSUPPORTED_DOC_TYPE", f"Unsupported doc_type: {doc_type}")
+
+    try:
+        resolved_from = resolve_business_date(date_from) if date_from else None
+        resolved_to = resolve_business_date(date_to) if date_to else None
+    except BusinessDateError as exc:
+        raise DocumentError("INVALID_DATE", str(exc))
+
+    if resolved_from and resolved_to and resolved_from > resolved_to:
+        raise DocumentError("INVALID_RANGE", "The start date is after the end date.")
+
+    if doc_type == "statement" and customer is None:
+        raise DocumentError("CUSTOMER_NOT_MATCHED", "Customer not found.")
+
+    if doc_type in ("invoice", "receipt") and entry is None:
+        raise DocumentError("NOT_FOUND", "That record could not be found.")
+
+    return doc_type, customer, resolved_from, resolved_to, entry
+
+
+def queue_document_send(business, *, doc_type, customer=None, entry=None, date_from=None, date_to=None,
+                         requested_format=None):
+    """Generalizes `queue_invoice_send` to every document type — the one safe
+    pipeline for invoice/receipt (entry-based) and statement/report
+    (date-range based) sends. Same non-raising, structured-outcome contract:
+    every "can't send" case here is a *reason* the caller surfaces plainly,
+    never an exception.
+    """
     from apps.billing.exceptions import FeatureNotOnPlan, UsageCapExceeded
     from apps.billing.services import enforce_feature_gate
     from apps.jobs.dispatch import enqueue
@@ -287,7 +354,8 @@ def queue_invoice_send(business, entry, customer):
 
     if not business.gateway_session_id:
         return {"sent": False, "reason": "NOT_CONNECTED"}
-    if not customer or not customer.phone:
+    to_phone = customer.phone if customer else None
+    if not to_phone:
         return {"sent": False, "reason": "NO_PHONE"}
 
     try:
@@ -297,23 +365,35 @@ def queue_invoice_send(business, entry, customer):
     except UsageCapExceeded:
         return {"sent": False, "reason": "QUOTA_EXCEEDED"}
 
+    output_format = requested_format or DEFAULT_FORMAT[doc_type]
+    if output_format not in SUPPORTED_FORMATS[doc_type]:
+        output_format = DEFAULT_FORMAT[doc_type]
+
     delivery = DocumentDelivery.objects.create(
         business=business,
         customer=customer,
-        doc_type="invoice",
-        # Bills go as an image so the customer reads them inline in WhatsApp
-        # without downloading anything — same default as the manual send.
-        requested_format="image",
-        to_phone=customer.phone,
+        doc_type=doc_type,
+        requested_format=output_format,
+        to_phone=to_phone,
         related_entry=entry,
         parameters={
-            "target_id": entry.id,
-            "customer_id": customer.id,
-            "date_from": None,
-            "date_to": None,
+            "target_id": entry.id if entry else None,
+            "customer_id": customer.id if customer else None,
+            "date_from": date_from.isoformat() if date_from else None,
+            "date_to": date_to.isoformat() if date_to else None,
         },
     )
     job = enqueue(business=business, type="document_send", payload={"delivery_id": delivery.id})
     delivery.job_task = job
     delivery.save(update_fields=["job_task"])
     return {"sent": True, "delivery_id": delivery.id, "job_id": job.id}
+
+
+def queue_invoice_send(business, entry, customer):
+    """Queues an invoice for `entry` to `customer`'s WhatsApp. Thin wrapper
+    over `queue_document_send` kept for `ConfirmDraftBillView`'s existing
+    call site — every "can't send" case is a *reason*, not an error: the
+    caller has already recorded the sale on the ledger, and a bill that is
+    saved but not delivered must never look like a bill that failed to save.
+    """
+    return queue_document_send(business, doc_type="invoice", customer=customer, entry=entry)

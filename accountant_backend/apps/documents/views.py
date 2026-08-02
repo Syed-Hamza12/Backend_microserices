@@ -14,28 +14,14 @@ from apps.jobs.dispatch import enqueue
 
 from .models import DocumentDelivery
 from .serializers import DocumentDeliverySerializer, RenderDocumentSerializer, SendDocumentSerializer
-from .services import DocumentError, build_payload_for, render_document
-
-ALL_DOC_TYPES = {"invoice", "receipt", "statement", "report"}
-
-# Which formats each document type can be produced in. Mirrors FastAPI's
-# /documents/formats so the app can offer only workable choices rather than
-# discovering a limitation via an error after the owner has tapped Send.
-SUPPORTED_FORMATS = {
-    "invoice": ["image", "pdf"],
-    "receipt": ["image", "pdf"],
-    "statement": ["pdf"],
-    "report": ["pdf"],
-}
-
-DEFAULT_FORMAT = {
-    # Bills default to an image: customers read them inline in WhatsApp without
-    # downloading anything. Statements and reports are multi-page by nature.
-    "invoice": "image",
-    "receipt": "image",
-    "statement": "pdf",
-    "report": "pdf",
-}
+from .services import (
+    ALL_DOC_TYPES,
+    DEFAULT_FORMAT,
+    SUPPORTED_FORMATS,
+    DocumentError,
+    build_payload_for,
+    render_document,
+)
 
 
 class DocumentThrottle(UserRateThrottle):
