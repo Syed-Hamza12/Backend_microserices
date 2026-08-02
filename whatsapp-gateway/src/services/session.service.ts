@@ -20,6 +20,7 @@ import {
 import logger from "../logger/logger.js";
 import { SessionStatus, type GatewaySession } from "../types/session.types.js";
 import { ApiError } from "../utils/ApiError.js";
+import { consumeIntentionalClose, withIntentionalClose } from "./intentionalClose.js";
 
 const sessions = new Map<string, GatewaySession>();
 const sockets = new Map<string, WASocket>();
@@ -41,11 +42,12 @@ const connectingSessions = new Set<string>();
 const reconnectTimers = new Map<string, NodeJS.Timeout>();
 
 /**
- * Session ids whose next socket close was caused by our own disconnectSession/unlinkSession call.
- * Checked-and-cleared by the connection hooks so a manual close is never mistaken for an
- * unexpected drop and silently auto-reconnected.
+ * Socket closes caused by our own openSocket/disconnectSession/unlinkSession
+ * call, so the connection hooks never mistake one for an unexpected drop and
+ * auto-reconnect from it. Scoped to the teardown it covers — see
+ * services/intentionalClose.ts for why an unscoped flag leaked and what that
+ * broke.
  */
-const intentionalCloses = new Set<string>();
 
 /** Timestamps of recent gateway-wide connection failures, for the circuit breaker. */
 let recentFailures: number[] = [];
@@ -225,8 +227,7 @@ async function openSocket(sessionId: string): Promise<void> {
         // mode this whole service is built to avoid.
         const existing = sockets.get(sessionId);
         if (existing) {
-            intentionalCloses.add(sessionId);
-            await destroySocket(existing);
+            await withIntentionalClose(sessionId, () => destroySocket(existing));
             sockets.delete(sessionId);
         }
 
@@ -240,10 +241,11 @@ async function openSocket(sessionId: string): Promise<void> {
                     // Nobody is scanning. Left alone, each expiring QR closes the
                     // connection and the reconnect produces another one, forever.
                     giveUp(session, `No QR scanned after ${QR_MAX_CYCLES} attempts.`);
-                    intentionalCloses.add(sessionId);
                     const active = sockets.get(sessionId);
                     if (active) {
-                        void destroySocket(active);
+                        // Still not awaited — this is a synchronous Baileys hook,
+                        // and blocking it was never the intent.
+                        void withIntentionalClose(sessionId, () => destroySocket(active));
                         sockets.delete(sessionId);
                     }
                     return;
@@ -274,7 +276,7 @@ async function openSocket(sessionId: string): Promise<void> {
                 logger.info({ sessionId, phone }, "Session connected.");
             },
             onClose: (shouldReconnect, statusCode) => {
-                if (intentionalCloses.delete(sessionId)) {
+                if (consumeIntentionalClose(sessionId)) {
                     return;
                 }
 
@@ -290,7 +292,7 @@ async function openSocket(sessionId: string): Promise<void> {
                 scheduleReconnect(sessionId, statusCode);
             },
             onLoggedOut: () => {
-                if (intentionalCloses.delete(sessionId)) {
+                if (consumeIntentionalClose(sessionId)) {
                     return;
                 }
 
@@ -359,12 +361,13 @@ export async function disconnectSession(sessionId: string): Promise<GatewaySessi
 
         const socket = sockets.get(sessionId);
         if (socket) {
-            intentionalCloses.add(sessionId);
-            try {
-                await destroySocket(socket);
-            } catch (err) {
-                logger.warn({ err, sessionId }, "Error while closing socket during disconnect (continuing).");
-            }
+            await withIntentionalClose(sessionId, async () => {
+                try {
+                    await destroySocket(socket);
+                } catch (err) {
+                    logger.warn({ err, sessionId }, "Error while closing socket during disconnect (continuing).");
+                }
+            });
         }
 
         sockets.delete(sessionId);
@@ -393,13 +396,16 @@ export async function unlinkSession(sessionId: string): Promise<GatewaySession> 
 
         const socket = sockets.get(sessionId);
         if (socket) {
-            intentionalCloses.add(sessionId);
-            try {
-                await socket.logout();
-            } catch (err) {
-                logger.warn({ err, sessionId }, "Error while logging out during unlink (continuing with cleanup).");
-            }
-            await destroySocket(socket);
+            // The flag must span the logout too, not just destroySocket:
+            // logout() can emit a close while the listeners are still attached.
+            await withIntentionalClose(sessionId, async () => {
+                try {
+                    await socket.logout();
+                } catch (err) {
+                    logger.warn({ err, sessionId }, "Error while logging out during unlink (continuing with cleanup).");
+                }
+                await destroySocket(socket);
+            });
         }
 
         sockets.delete(sessionId);
