@@ -1,6 +1,4 @@
 import { randomUUID } from "crypto";
-import { readdir, rm } from "fs/promises";
-import path from "path";
 
 import type { WASocket } from "@whiskeysockets/baileys";
 
@@ -18,6 +16,7 @@ import {
     RESTORE_STAGGER_MS
 } from "../config/reconnect.js";
 import logger from "../logger/logger.js";
+import { storageProvider } from "../storage/index.js";
 import { SessionStatus, type GatewaySession } from "../types/session.types.js";
 import { ApiError } from "../utils/ApiError.js";
 import { consumeIntentionalClose, withIntentionalClose } from "./intentionalClose.js";
@@ -163,6 +162,14 @@ function cancelScheduledReconnect(sessionId: string): void {
 }
 
 export function createSession(displayName: string): GatewaySession {
+    if (sessions.size >= env.MAX_SESSIONS) {
+        throw new ApiError(
+            409,
+            "MAX_SESSIONS_REACHED",
+            `Gateway already has the maximum of ${env.MAX_SESSIONS} sessions registered.`
+        );
+    }
+
     const id = randomUUID();
     const now = new Date();
 
@@ -319,8 +326,7 @@ async function openSocket(sessionId: string): Promise<void> {
                 // block the event handler, and a failed cleanup here still
                 // leaves the session correctly marked UNLINKED for the
                 // owner to retry.
-                const sessionDir = path.join(env.SESSION_PATH, sessionId);
-                rm(sessionDir, { recursive: true, force: true }).catch((err) => {
+                storageProvider.deleteSession(sessionId).catch((err) => {
                     logger.warn({ err, sessionId }, "Error while deleting session files after phone-side logout.");
                 });
             }
@@ -429,9 +435,8 @@ export async function unlinkSession(sessionId: string): Promise<GatewaySession> 
 
         sockets.delete(sessionId);
 
-        const sessionDir = path.join(env.SESSION_PATH, sessionId);
         try {
-            await rm(sessionDir, { recursive: true, force: true });
+            await storageProvider.deleteSession(sessionId);
         } catch (err) {
             logger.warn({ err, sessionId }, "Error while deleting session files during unlink.");
         }
@@ -456,12 +461,10 @@ export async function unlinkSession(sessionId: string): Promise<GatewaySession> 
  * WhatsApp logins. When enabled for a real deployment, connects are staggered.
  */
 export async function restoreSessionsFromDisk(): Promise<void> {
-    let entries: string[];
+    const entries = await storageProvider.listSessionIds();
 
-    try {
-        entries = await readdir(env.SESSION_PATH);
-    } catch {
-        logger.info("No sessions directory found on disk, nothing to restore.");
+    if (entries.length === 0) {
+        logger.info("No sessions found in storage, nothing to restore.");
         return;
     }
 

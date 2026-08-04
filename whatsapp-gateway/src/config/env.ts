@@ -7,6 +7,10 @@ const envSchema = z.object({
     NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
     LOG_LEVEL: z.enum(["error", "warn", "info", "debug"]).default("info"),
     SESSION_PATH: z.string().default("./sessions"),
+    /** Selects the session storage backend. "firebase" is a placeholder — see docs/whatsapp_gateway_guide.md. */
+    STORAGE_PROVIDER: z.enum(["local", "firebase"]).default("local"),
+    /** Hard cap on concurrently registered sessions, enforced in session.service.createSession. */
+    MAX_SESSIONS: z.coerce.number().int().positive().default(30),
     WHATSAPP_GATEWAY_JWT_SECRET: z.string().min(1),
     /**
      * Comma-separated origins allowed to call this gateway from a browser.

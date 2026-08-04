@@ -1,9 +1,7 @@
-import path from "path";
+import makeWASocket, { Browsers, type WASocket } from "@whiskeysockets/baileys";
 
-import makeWASocket, { Browsers, useMultiFileAuthState, type WASocket } from "@whiskeysockets/baileys";
-
-import { env } from "../config/env.js";
 import logger from "../logger/logger.js";
+import { storageProvider } from "../storage/index.js";
 import { handleConnectionUpdate, type ConnectionHooks } from "./connection.handler.js";
 import { registerMessageReceiver } from "./message.receiver.js";
 
@@ -15,8 +13,7 @@ import { registerMessageReceiver } from "./message.receiver.js";
 const BROWSER_FINGERPRINT = Browsers.appropriate("Desktop");
 
 export async function createSocket(sessionId: string, hooks: ConnectionHooks): Promise<WASocket> {
-    const sessionDir = path.join(env.SESSION_PATH, sessionId);
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { state, saveCreds } = await storageProvider.loadAuthState(sessionId);
 
     const socket = makeWASocket({
         auth: state,
