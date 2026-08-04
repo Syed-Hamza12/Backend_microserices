@@ -194,17 +194,19 @@ def _collect_keys(var_name, max_n=10):
 
 
 # GROQ_API_KEY (bare) still works alone for a single-key setup; add
-# GROQ_API_KEY_1, _2, ... up to _10 for automatic rotation across multiple
-# free-tier accounts once one starts hitting rate limits.
-GROQ_API_KEYS = _collect_keys("GROQ_API_KEY")
+# GROQ_API_KEY_1, _2, ... up to _20 for automatic rotation across multiple
+# free-tier accounts once one starts hitting rate limits. The cap is a plain
+# function argument (max_n) — raise it here alone if you ever need more than
+# 20, nothing else in the rotation code has a hardcoded count.
+GROQ_API_KEYS = _collect_keys("GROQ_API_KEY", max_n=20)
 GROQ_MODEL_FAST = os.environ.get("GROQ_MODEL_FAST", "llama-3.1-8b-instant")
 GROQ_MODEL_REASONING = os.environ.get("GROQ_MODEL_REASONING", "llama-3.3-70b-versatile")
 
 # Vision extraction: Gemini is called directly from Django's job worker for now (see
 # ai_automation_layer.md Section 3) — an empty GEMINI_API_KEYS list means the worker fails
 # that job cleanly with a NOT_CONFIGURED error until at least one key is added. Same
-# GEMINI_API_KEY_1.._10 rotation convention as Groq above.
-GEMINI_API_KEYS = _collect_keys("GEMINI_API_KEY")
+# GEMINI_API_KEY_1.._20 rotation convention as Groq above.
+GEMINI_API_KEYS = _collect_keys("GEMINI_API_KEY", max_n=20)
 # Handwritten shopkeeper bills are the hard case, and flash-lite misreads them often
 # enough to matter. Note the *Pro* models are not a drop-in upgrade here: on the free
 # tier they return 429 RESOURCE_EXHAUSTED, which would fail every extraction. Stay on a

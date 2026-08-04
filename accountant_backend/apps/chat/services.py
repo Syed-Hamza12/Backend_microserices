@@ -288,36 +288,149 @@ def to_urdu_script(text):
     return converted
 
 
-#: Appended when a Roman Urdu reply leaked native/Arabic script — a targeted
-#: nudge for the retry, not a generic "try again".
-SCRIPT_LEAK_REMINDER = (
-    "\n\nIMPORTANT: your last reply's \"text\" contained Urdu script. \"text\" for Roman Urdu MUST be "
-    "Latin letters only (e.g. \"Ali ka 5000 ka bill ban gaya\"). Reply again with \"text\" in Latin "
-    "script only."
-)
-
-
 def select_model_tier(message_text, language):
-    """Which model answers this turn — two Groq tiers. `needs_reasoning`
-    recognises bill/edit/document intent in English, Urdu and Roman Urdu
-    alike. Language then overrides intent: both Urdu variants go to the
-    reasoning tier (70B) regardless of intent, since the fast model (8B)
-    cannot WRITE Urdu acceptably at all — it once returned "پاپ کا جو 1 ڑڑ
-    خَد 20 مۉّد" to a real owner, which is not words.
+    """Which model handles the JSON/intent step — two Groq tiers. Purely
+    intent-complexity-driven now: `needs_reasoning` recognises bill/edit/
+    document intent in English, Urdu and Roman Urdu alike, and that alone
+    decides fast (8B) vs reasoning (70B) for THIS step.
+
+    Language used to force the reasoning tier by itself for ur/roman_ur,
+    unconditionally — because 8B cannot WRITE Urdu acceptably (it once
+    returned "پاپ کا جو 1 ڑڑ خَد 20 مۉّد" to a real owner, which is not
+    words). That write-quality problem is real, but it is a problem with
+    PROSE, not with understanding the message or filling out the JSON
+    contract — so it is now solved downstream instead: for `ur`/`roman_ur`,
+    the JSON step's own "text" is discarded entirely (never shown to the
+    owner, see `generate_reply`), and `_write_final_reply` COMPOSES a fresh
+    reply on 70B from the owner's message plus a plain execution summary —
+    never by forcing the whole intent/planning step onto the expensive
+    model, and never by rewriting the JSON step's own sentence. See
+    AGENTS.md / AGENT_DATA_FLOW.md's model-routing sections for the full
+    before/after picture and the token-cost reasoning behind this.
 
     Gemini is not used for chat replies at all — its free-tier quota (20
     requests/day) can't carry ordinary chat volume; it is reserved for
     `apps.image_info_extractor.gemini_client.extract_receipt_data` (OCR)
-    only. A Roman Urdu reply that leaks script gets a same-tier retry with a
-    stricter reminder instead (see `generate_reply`), not a different model.
+    only.
     """
-    if language in ("ur", "roman_ur"):
-        return "reasoning"
     return "reasoning" if prompt.needs_reasoning(message_text) else "fast"
 
 
 def _call_model(tier, messages):
     return call_groq(messages=messages, reasoning=(tier == "reasoning"))
+
+
+#: Languages whose final reply text/speech_text are COMPOSED FRESH by the
+#: 70B "response writer" step, from execution facts — never shown the JSON
+#: step's own prose. English isn't here: 8B's English prose is fine, so
+#: needs_reasoning alone already routes English's genuinely complex turns to
+#: 70B for the whole call — no separate writer pass is needed for it.
+_WRITER_LANGUAGES = ("ur", "roman_ur")
+
+
+def _build_execution_summary(reply_data):
+    """Plain, structured facts about what this turn produced — the ONLY
+    description of "what happened" the response-writer step is given,
+    besides the owner's own message. Deliberately never the JSON step's own
+    "text" unless nothing else describes the turn at all (a plain question/
+    answer with no draft) — see `generate_reply` for why: that field is
+    8B/70B's own prose, and for `ur`/`roman_ur` turns it must never reach
+    the owner directly, whether raw or "polished". Building this summary
+    from the contract's own structured fields (draft_bill / draft_action's
+    `summary` / draft_document's `summary`) keeps it purely factual.
+    """
+    draft_bill = reply_data.get("draft_bill")
+    if isinstance(draft_bill, dict):
+        bits = ["A sales bill was prepared"]
+        if draft_bill.get("customer_name") or draft_bill.get("customer_name_guess"):
+            bits.append(f"for customer {draft_bill.get('customer_name') or draft_bill.get('customer_name_guess')}")
+        if draft_bill.get("total_amount") is not None:
+            bits.append(f"total amount {draft_bill['total_amount']}")
+        if draft_bill.get("payment_received"):
+            bits.append(f"payment received {draft_bill['payment_received']}")
+        status = (
+            "it has already been recorded on the ledger"
+            if draft_bill.get("save_now")
+            else "it is awaiting the owner's confirmation before it is recorded"
+        )
+        return ", ".join(bits) + f"; {status}."
+
+    draft_action = reply_data.get("draft_action")
+    if isinstance(draft_action, dict) and draft_action.get("summary"):
+        return f"{draft_action['summary']}. This change is awaiting the owner's confirmation."
+
+    draft_document = reply_data.get("draft_document")
+    if isinstance(draft_document, dict) and draft_document.get("summary"):
+        return f"{draft_document['summary']}."
+
+    # No draft at all — a plain question, answer, or clarification turn.
+    # There is no structured fact to summarize, so the JSON step's own
+    # "text" is used here purely as CONTENT for the writer to re-express in
+    # its own words — never shown to the owner directly.
+    return reply_data.get("text") or ""
+
+
+def _write_final_reply(user_message, execution_summary, language):
+    """The 70B 'response writer' step. Composes a BRAND NEW reply from the
+    owner's original message plus a plain-language execution summary of
+    what actually happened — it is never handed the JSON step's own
+    sentence to rewrite. Deliberately does NOT receive the system prompt,
+    business context, chat history, or the JSON contract: it cannot see or
+    influence intent, planning, capabilities, or execution, only compose
+    the final wording from facts it's told. See AGENTS.md's model-routing
+    section for the full picture.
+
+    Returns (text, speech_text). Falls back to the plain execution summary
+    itself (still passed through `to_urdu_script` for roman_ur, so speech
+    isn't silently lost) on any failure — a rough, factual fallback beats
+    losing the reply.
+    """
+    execution_summary = (execution_summary or "").strip()
+    user_content = f"OWNER'S MESSAGE:\n{user_message}\n\nEXECUTION SUMMARY:\n{execution_summary or '(none)'}"
+
+    def _fallback():
+        # No model output at all — the execution summary is the closest
+        # thing to a factual reply available, so use it verbatim rather
+        # than show nothing.
+        fallback_text = execution_summary or user_message
+        if language == "roman_ur":
+            return fallback_text, (to_urdu_script(fallback_text) or None)
+        return fallback_text, None
+
+    try:
+        if language == "roman_ur":
+            raw = call_groq(
+                messages=[
+                    {"role": "system", "content": prompt.RESPONSE_WRITER_ROMAN_UR},
+                    {"role": "user", "content": user_content},
+                ],
+                reasoning=True,
+            )
+            composed = json.loads(raw)
+            text = (composed.get("text") or "").strip()
+            speech = (composed.get("speech_text") or "").strip()
+            if not text or has_urdu_script(text):
+                logger.warning("response writer (roman_ur) returned unusable text; using execution summary")
+                return _fallback()
+            return text, (speech or to_urdu_script(text) or None)
+
+        # language == "ur"
+        raw = call_groq(
+            messages=[
+                {"role": "system", "content": prompt.RESPONSE_WRITER_UR},
+                {"role": "user", "content": user_content},
+            ],
+            reasoning=True,
+            response_format_json=False,
+        )
+        composed = (raw or "").strip()
+        if not composed or not has_urdu_script(composed):
+            logger.warning("response writer (ur) returned unusable text; using execution summary")
+            return _fallback()
+        return composed, None
+    except Exception as exc:  # noqa: BLE001 - a rough fallback beats losing the reply
+        logger.warning("response writer step failed, using execution summary: %s", exc)
+        return _fallback()
 
 
 def generate_reply(*, business, conversation, text, language=None):
@@ -339,17 +452,11 @@ def generate_reply(*, business, conversation, text, language=None):
                 ]
             continue
 
-        if attempt == 0 and language == "roman_ur" and has_urdu_script(candidate.get("text") or ""):
-            # Groq's Roman Urdu reply leaked native/Arabic script instead of
-            # staying Latin. Retried once, same tier, with a targeted
-            # reminder — no fallback to a different model (Gemini is
-            # reserved for OCR only, see select_model_tier).
-            logger.warning("groq roman_ur reply leaked script, retrying with a stricter reminder")
-            messages = messages[:-1] + [
-                {"role": "user", "content": text + SCRIPT_LEAK_REMINDER}
-            ]
-            continue
-
+        # No script-leak retry here anymore: the JSON step's own "text" for
+        # roman_ur/ur is a discarded placeholder (see below) — the response
+        # writer composes the real reply from execution facts and is
+        # responsible for correct script on its own output. Retrying the
+        # JSON step over a field nobody sees would just burn an extra call.
         reply_data = candidate
         break
 
@@ -370,25 +477,17 @@ def generate_reply(*, business, conversation, text, language=None):
     # far better outcome than gibberish.
     link_drafted_customer(business, reply_data.get("draft_bill"))
 
-    speech_text = (reply_data.get("speech_text") or "").strip()
-    reply_text = reply_data.get("text") or ""
-    if language == "roman_ur" and not ai_failed:
-        # ALWAYS re-derive, never keep the chat model's own speech_text. The
-        # previous version only filled in an empty one — so whenever Llama did
-        # emit Urdu script it was kept, and Llama's Urdu is not words:
-        # "pap ka 25000 ka bill taiyar hai" came out as
-        # "پَټ کا 25000 کا بل ٹئار هَ". The check was "is there any Urdu script
-        # here", which mangled output passes just as easily as correct output.
-        # This text is only ever spoken aloud, so it goes to the model that can
-        # actually write Urdu (see to_urdu_script).
-        speech_text = to_urdu_script(reply_text)
-
+    # For ur/roman_ur, the JSON step's own "text" is NEVER the final reply —
+    # it is stored here only as a placeholder until the response-writer step
+    # below composes the real one from execution facts. For every other
+    # language (or a failed call, whose reply_data is already the fixed,
+    # correctly-localized FALLBACK_REPLIES text) it IS the final reply.
     ChatMessage.objects.create(conversation=conversation, sender="owner", text=text)
     ai_message = ChatMessage.objects.create(
         conversation=conversation,
         sender="ai",
-        text=reply_data.get("text"),
-        speech_text=speech_text or None,
+        text=reply_data.get("text") or "",
+        speech_text=(reply_data.get("speech_text") or "").strip() or None,
         draft_bill=reply_data.get("draft_bill"),
         document_ready=reply_data.get("document_ready"),
         draft_action=reply_data.get("draft_action"),
@@ -401,21 +500,49 @@ def generate_reply(*, business, conversation, text, language=None):
 
     # Recorded only when the owner asked for it in words. Done after the message
     # exists so the audit row can point at the message that caused the entry.
+    save_now_failed = False
     draft = reply_data.get("draft_bill") or {}
     if draft.get("save_now") and not ai_failed:
         if not record_drafted_bill(business, ai_message):
-            # Say so rather than leaving the owner believing it is on the
-            # ledger — the reply text already claims it was saved, because the
-            # model was told to only set save_now when it means it.
-            ai_message.text = (
-                f"{ai_message.text}\n\n(I could not record it automatically — "
-                "please check the draft and confirm it.)"
-            )
-            ai_message.speech_text = None
-            ai_message.save(update_fields=["text", "speech_text"])
+            save_now_failed = True
+            if language not in _WRITER_LANGUAGES:
+                # English: no response-writer step runs below, so this must
+                # be said directly here, same as before. Say so rather than
+                # leaving the owner believing it is on the ledger — the reply
+                # text already claims it was saved, because the model was
+                # told to only set save_now when it means it.
+                ai_message.text = (
+                    f"{ai_message.text}\n\n(I could not record it automatically — "
+                    "please check the draft and confirm it.)"
+                )
+                ai_message.speech_text = None
+                ai_message.save(update_fields=["text", "speech_text"])
+            # For ur/roman_ur this failure is folded into the execution
+            # summary instead (see below) so the response writer composes it
+            # in the owner's language, rather than appending an English
+            # sentence to a reply that hasn't been written yet.
 
+    agent_overwrote_text = False
     if not ai_failed:
-        apply_safe_document_send(business, conversation, ai_message, reply_data, language)
+        agent_overwrote_text = apply_safe_document_send(business, conversation, ai_message, reply_data, language)
+
+    if language in _WRITER_LANGUAGES and not ai_failed and not agent_overwrote_text:
+        # The response-writer step: NEVER given the JSON step's own "text"
+        # to rewrite. It composes a brand new reply from the owner's message
+        # plus a plain-language summary of what was actually decided/done —
+        # see _build_execution_summary / _write_final_reply. This is the
+        # ONLY place a Roman Urdu/Urdu owner's final reply text comes from;
+        # 8B (or 70B on the JSON step) never reaches the owner directly.
+        summary = _build_execution_summary(reply_data)
+        if save_now_failed:
+            summary = (summary + " " if summary else "") + (
+                "The bill could NOT be recorded automatically due to an error — "
+                "ask the owner to check the draft and confirm/save it manually."
+            )
+        final_text, final_speech = _write_final_reply(text, summary, language)
+        ai_message.text = final_text
+        ai_message.speech_text = final_speech or None
+        ai_message.save(update_fields=["text", "speech_text"])
 
     return ai_message
 
@@ -428,6 +555,14 @@ def apply_safe_document_send(business, conversation, ai_message, reply_data, lan
     `apps.agent.planner._GENERATOR_FOR_DOC_TYPE`); anything else (a report,
     or a doc type it couldn't resolve) falls through untouched and keeps
     behaving exactly like the existing tap-confirm `draft_document` flow.
+
+    Returns True if `ai_message.text`/`speech_text` were already set here to
+    their final, already-localized value (a Clarification question or the
+    agent layer's own execution-outcome text) — `generate_reply` uses this
+    to skip running the response-writer step again over already-final text.
+    Returns False if nothing was auto-composed (`plan is None`) or the
+    executed plan produced no outcome text, in which case the caller must
+    still supply a final reply.
     """
     from apps.agent.executor import execute_plan
     from apps.agent.planner import plan_from_reply
@@ -435,23 +570,26 @@ def apply_safe_document_send(business, conversation, ai_message, reply_data, lan
 
     plan = plan_from_reply(business, conversation, ai_message, reply_data)
     if plan is None:
-        return
+        return False
 
     if isinstance(plan, Clarification):
         # The model believed this was resolvable (it named a customer/doc
         # type) but the agent layer found it wasn't — say so plainly instead
         # of leaving whatever premature/optimistic text the model wrote.
         _overwrite_reply_text(ai_message, plan.message, language)
-        return
+        return True
 
     outcome = execute_plan(business=business, conversation=conversation, message=ai_message, steps=plan)
+    overwrote_text = False
     if outcome.text:
         _overwrite_reply_text(ai_message, outcome.text, language)
+        overwrote_text = True
     if outcome.pending_delivery_id:
         from apps.documents.models import DocumentDelivery
 
         ai_message.pending_delivery = DocumentDelivery.objects.filter(pk=outcome.pending_delivery_id).first()
         ai_message.save(update_fields=["pending_delivery"])
+    return overwrote_text
 
 
 def _overwrite_reply_text(ai_message, new_text, language):

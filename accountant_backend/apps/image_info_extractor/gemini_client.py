@@ -120,7 +120,7 @@ def extract_receipt_data(image_bytes: bytes, mime_type: str = "image/jpeg") -> d
     (see services.handle_image_extract_job's fallback-apology path).
 
     Free-tier key rotation: settings.GEMINI_API_KEYS is one or more API keys
-    (GEMINI_API_KEY plus GEMINI_API_KEY_1.._10 in .env). Always starts from
+    (GEMINI_API_KEY plus GEMINI_API_KEY_1.._20 in .env). Always starts from
     key 0 on every call — see apps.chat.groq_client.call_groq's docstring
     for why (a reset key's quota comes back into use automatically, on the
     very next call, with no separate "has it reset yet" tracking needed)."""

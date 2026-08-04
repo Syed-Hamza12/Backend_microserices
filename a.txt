@@ -1,0 +1,326 @@
+We are NOT changing the architecture.
+
+Keep the existing deterministic planner/executor architecture exactly as it is.
+
+Do NOT migrate to LangChain.
+Do NOT migrate to LangGraph.
+Do NOT introduce an Agent framework.
+Do NOT introduce tool calling.
+Do NOT replace the planner.
+Do NOT redesign the GoalManager.
+
+This task is ONLY about optimizing model routing, reducing token consumption, and improving API-key reliability while preserving all existing behavior.
+
+==============================================================================
+PROJECT PRINCIPLES (MUST REMAIN TRUE)
+==============================================================================
+
+The current architecture intentionally works like this:
+
+User
+    ↓
+LLM
+    ↓
+JSON Contract
+    ↓
+Planner
+    ↓
+Executor
+    ↓
+GoalManager
+    ↓
+Response
+
+The LLM never executes tools.
+
+The planner and executor remain deterministic Python.
+
+Capabilities remain the only safety boundary.
+
+Financial confirmations remain unchanged.
+
+Risk tiers remain unchanged.
+
+GoalManager remains unchanged.
+
+The JSON contract remains unchanged.
+
+Everything currently working must continue working exactly the same.
+
+==============================================================================
+
+WHY THIS CHANGE IS NEEDED
+==============================================================================
+
+Roman Urdu users require llama-3.3-70b-versatile because response quality from 8B is not acceptable.
+
+However today the expensive model is performing TWO jobs:
+
+1.
+Understanding the message
+Generating JSON
+Planning information
+
+2.
+Writing the Roman Urdu reply.
+
+Only the second job actually requires 70B.
+
+Intent extraction and structured JSON generation do not require high-quality conversational Roman Urdu.
+
+Therefore we want to split these responsibilities.
+
+==============================================================================
+NEW ARCHITECTURE
+==============================================================================
+
+Incoming Message
+        │
+        ▼
+llama-3.1-8b-instant
+(JSON ONLY)
+        │
+        ▼
+Existing Planner
+        │
+        ▼
+Existing Executor
+        │
+        ▼
+Execution Result
+        │
+        ▼
+llama-3.3-70b-versatile
+(Roman Urdu reply ONLY)
+
+==============================================================================
+
+RESPONSIBILITY OF 8B
+==============================================================================
+
+8B becomes responsible for ONLY:
+
+• Intent understanding
+• Entity extraction
+• draft_document
+• draft_bill
+• draft_action
+• clarification
+• JSON generation
+• Output contract
+
+Everything currently produced by the JSON contract should continue to be produced by the 8B model.
+
+Nothing should change from the planner's perspective.
+
+Planner should receive identical JSON as before.
+
+==============================================================================
+
+RESPONSIBILITY OF 70B
+==============================================================================
+
+70B should NEVER decide:
+
+• intent
+• customer lookup
+• planning
+• capabilities
+• tool selection
+• execution
+• document generation
+• billing logic
+
+Execution has already completed before 70B is called.
+
+70B should ONLY generate the final human-facing Roman Urdu response.
+
+It should have zero influence over business logic.
+
+==============================================================================
+
+VERY IMPORTANT TOKEN OPTIMIZATION
+==============================================================================
+
+The current implementation likely sends a very large prompt to the 70B model.
+
+remove the unnecessary thing 
+
+
+
+The 70B model should become a response writer only.
+
+==============================================================================
+
+DO NOT MODIFY
+==============================================================================
+
+Do NOT redesign:
+
+planner.py
+
+executor.py
+
+GoalManager
+
+capabilities.py
+
+financial confirmation flow
+
+risk tiers
+
+planner algorithm
+
+backward chaining
+
+JSON contract
+
+Those components are already correct.
+
+==============================================================================
+
+API KEY ROTATION REVIEW (CRITICAL)
+==============================================================================
+
+Please perform a full code review of the Groq API key rotation implementation.
+
+There is a production issue that needs investigation.
+
+Observed behavior:
+
+When the currently active Groq API key has exhausted its quota, the backend sometimes returns an error directly to the chat/user.
+
+Only after the user sends another message does the backend rotate to the next API key and succeed.
+
+Expected behavior:
+
+If one API key fails because of:
+
+• quota exceeded
+• rate limit
+• exhausted credits
+• temporary retryable API failure
+
+The backend should automatically retry using the next available API key BEFORE returning any error to the frontend.
+
+The user should never see an API quota error if another healthy API key is available.
+
+Please investigate whether there is a bug in:
+
+• retry logic
+• rotation logic
+• exception handling
+• recursion/loop exit
+• async handling
+• request retry order
+
+If a bug exists, fix it.
+
+The frontend should receive an error ONLY if every configured API key has failed.
+
+==============================================================================
+
+EXTEND GROQ API ROTATION
+==============================================================================
+
+Currently the project supports approximately 10 Groq API keys.
+
+Please extend the implementation to support 20 Groq API keys.
+
+Requirements:
+
+• clean implementation
+• configurable
+• environment driven
+• no duplicated code
+• easy to extend later
+• preserve current behavior
+• maintain thread safety
+
+Prefer configuration-driven loading instead of hardcoding key numbers.
+
+==============================================================================
+
+GEMINI IMAGE INFO EXTRACTOR
+==============================================================================
+
+The project also contains an Image Information Extractor.
+
+This service uses:
+
+Gemini model for image info extractor
+
+Please locate the Gemini API rotation implementation.
+
+Currently it also rotates approximately 10 API keys.
+
+Extend this implementation to support 20 API keys using the same clean configuration approach.
+
+Maintain identical behavior.
+
+==============================================================================
+
+IMPLEMENTATION QUALITY
+==============================================================================
+
+Do not create unnecessary abstractions.
+
+Keep the project easy to maintain.
+
+Prefer improving existing code rather than rewriting it.
+
+If duplicate logic exists between Groq rotation and Gemini rotation, consider extracting a small reusable helper only if it genuinely simplifies the codebase.
+
+==============================================================================
+
+PERFORMANCE GOALS
+==============================================================================
+
+This refactor should achieve:
+
+✓ Lower 70B token consumption
+
+✓ Lower response latency
+
+✓ Lower inference cost
+
+✓ Better separation of responsibilities
+
+✓ Automatic API-key failover
+
+✓ No user-visible quota errors when another key is available
+
+✓ Support 20 Groq API keys
+
+✓ Support 20 Gemini API keys
+
+✓ Preserve current planner/executor architecture
+
+==============================================================================
+
+BEFORE WRITING CODE
+==============================================================================
+
+First perform a complete review.
+
+Explain:
+
+1. Whether this architecture change is compatible with the current implementation.
+
+2. Which files require modification.
+
+3. The exact execution flow before and after.
+
+4. Any hidden risks.
+
+5. Whether the API key rotation bug actually exists.
+
+6. Whether the current retry implementation is correct.
+
+7. Whether there are edge cases that could still surface quota errors.
+
+After the review, implement the complete solution.
+
+Do not stop after analysis.
+
+Implement every approved change.
