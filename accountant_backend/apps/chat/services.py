@@ -691,6 +691,7 @@ def _report_view_from_draft_document(draft_document):
         else f"Details from {date_from.isoformat()} to {date_to.isoformat()}"
     )
     return {
+        "kind": "range",
         "date_from": date_from.isoformat(),
         "date_to": date_to.isoformat(),
         "summary": summary,
@@ -700,17 +701,27 @@ def _report_view_from_draft_document(draft_document):
 def _attach_report_view(business, ai_message, owner_text):
     """Deterministically attaches `report_view` whenever the owner's message
     named a date/range together with query intent ("pichle hafte ki detail
-    batao", "10 se 20 tareek ka hisaab") — the mobile app then shows a "View"
-    button that fetches the real entries directly from the ledger
-    (GET /sales/entries/), rather than trusting anything the model
-    summarized in "text". Deliberately not gated on anything the model
-    itself produced: prompt-compliance is exactly what this codebase has
-    repeatedly found unreliable for facts (dates, delivery status, DB
-    contents — see this module's other deterministic checks), and a period
-    query is the highest-stakes case yet, since the "detail" being asked
-    about spans many customers at once.
+    batao", "10 se 20 tareek ka hisaab"), OR asked a ranking question like
+    "top 5 customers" — the mobile app then shows a "View" button that
+    fetches the real data directly (GET /sales/entries/ for a date range,
+    the Reports screen's customers tab for a ranking), rather than trusting
+    anything the model summarized in "text". Deliberately not gated on
+    anything the model itself produced: prompt-compliance is exactly what
+    this codebase has repeatedly found unreliable for facts (dates, delivery
+    status, DB contents — see this module's other deterministic checks), and
+    these queries are the highest-stakes case yet, since the answer spans
+    many customers at once.
     """
     text = owner_text or ""
+
+    # Ranking has no date range at all — checked first and independently of
+    # QUERY_HINT_PATTERN/date extraction below, which would otherwise never
+    # match "top 5 customers" (no date named) and leave it with no button.
+    if prompt.TOP_CUSTOMERS_HINT_PATTERN.search(text):
+        ai_message.report_view = {"kind": "top_customers", "summary": "Top customers"}
+        ai_message.save(update_fields=["report_view"])
+        return
+
     if not (prompt.QUERY_HINT_PATTERN.search(text) or prompt.BALANCE_HINT_PATTERN.search(text)):
         return
     date_range = prompt.extract_date_range_from_text(text)
@@ -724,6 +735,7 @@ def _attach_report_view(business, ai_message, owner_text):
         else f"Details from {date_from.isoformat()} to {date_to.isoformat()}"
     )
     ai_message.report_view = {
+        "kind": "range",
         "date_from": date_from.isoformat(),
         "date_to": date_to.isoformat(),
         "summary": summary,

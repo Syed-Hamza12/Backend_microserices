@@ -314,6 +314,22 @@ def build_aggregate_context(business):
 # never saw, it filled in a plausible-looking amount and item — a different
 # one on each ask, for the same question. Answers to factual DB questions
 # must always come from build_entry_context, never from the model's memory.
+#: "Top 5 customers", "best customers", "sab se zyada baaki wale customers" —
+#: a ranking query, never a date range (there is no period to ask about), so
+#: it needs its own detection separate from QUERY_HINT_PATTERN/date
+#: extraction below. The model only ever answers this from the "Top
+#: customers by amount owed" context text (build_business_context) with no
+#: structured field at all, so nothing gave the mobile app a View button for
+#: it — this exists to attach one deterministically, the same way date-range
+#: queries already get one.
+TOP_CUSTOMERS_HINT_PATTERN = re.compile(
+    r"\btop\b.*\bcustomers?\b|\bbest\b.*\bcustomers?\b|\bbiggest\b.*\bcustomers?\b"
+    r"|\bcustomers?\b.*\btop\b"
+    # Roman Urdu
+    r"|\bsab se zyada\b|\bsabse zyada\b|\bzyada wale\b|\bbade customers\b",
+    re.IGNORECASE,
+)
+
 QUERY_HINT_PATTERN = re.compile(
     r"\bdetail\b|\bdetails\b|\bitem\b|\bitems\b|\btook\b|\bbought\b|\bpurchased\b"
     r"|\bwhat did\b|\bwhich\b.*\bbuy\b|\bshow\b|\blist\b"
