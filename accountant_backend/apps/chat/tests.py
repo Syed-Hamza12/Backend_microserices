@@ -117,6 +117,51 @@ class DraftConfirmConcurrencyTests(APITestCase):
         self.assertFalse(self.message.draft_confirmed)
 
 
+class ConfirmDraftCustomerTests(APITestCase):
+    """New-customer proposals via chat (`draft_customer`) — the duplicate
+    guard is the entire point: an AI reading "Pap" one week and "Papa" the
+    next must never be able to fragment one person's ledger into two rows."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="o@x.com", email="o@x.com", password="pw")
+        self.business = Business.objects.create(owner=self.user, business_name="Test Shop")
+        self.conversation = Conversation.objects.create(business=self.business)
+        self.client.force_authenticate(user=self.user)
+
+    def _message(self, **draft_customer):
+        return ChatMessage.objects.create(
+            conversation=self.conversation,
+            sender="ai",
+            text="Add new customer?",
+            draft_customer={"name": "Bilal", "phone": "03001234567", "opening_balance": 0, **draft_customer},
+        )
+
+    def test_confirm_creates_a_new_customer(self):
+        message = self._message()
+        response = self.client.post(f"/api/chat/draft/{message.id}/confirm-customer/")
+        self.assertEqual(response.status_code, 200, response.content)
+        customer = Customer.objects.get(business=self.business, name="Bilal")
+        self.assertEqual(customer.phone, "923001234567")
+        self.assertEqual(response.json()["data"]["customer_id"], customer.id)
+
+    def test_refuses_a_near_duplicate_name(self):
+        Customer.objects.create(business=self.business, name="Bilal", phone="923000000000")
+        message = self._message()
+        response = self.client.post(f"/api/chat/draft/{message.id}/confirm-customer/")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "POSSIBLE_DUPLICATE")
+        self.assertEqual(Customer.objects.filter(business=self.business, name="Bilal").count(), 1)
+
+    def test_double_confirm_creates_only_one_customer(self):
+        message = self._message()
+        first = self.client.post(f"/api/chat/draft/{message.id}/confirm-customer/")
+        second = self.client.post(f"/api/chat/draft/{message.id}/confirm-customer/")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 400)
+        self.assertEqual(second.json()["error"]["code"], "ALREADY_CONFIRMED")
+        self.assertEqual(Customer.objects.filter(business=self.business, name="Bilal").count(), 1)
+
+
 class SaveNowTests(TestCase):
     """`draft_bill.save_now` is the only path that puts money on the ledger
     without a human tap — set when the owner says "record mein save kar do".
@@ -536,6 +581,53 @@ class ModelFallbackTests(TestCase):
         with mock.patch("apps.chat.services.call_groq", return_value=clean) as mock_groq:
             services.generate_reply(business=self.business, conversation=self.conversation, text="bill banao")
         mock_groq.assert_called_once()
+
+
+class WhatsAppNotConnectedNoticeTests(TestCase):
+    """A model occasionally writes an optimistic "sending it now" reply even
+    when this business has never connected WhatsApp at all (no
+    gateway_session_id) — the deterministic backstop in
+    services._enforce_whatsapp_not_connected_notice must correct that rather
+    than let the owner believe something was sent that never could be."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="w@x.com", email="w@x.com", password="pw")
+        self.business = Business.objects.create(owner=self.user, business_name="Test Shop", language="en")
+        self.conversation = Conversation.objects.create(business=self.business)
+        self.assertFalse(self.business.gateway_session_id)
+
+    def _payload(self, text):
+        return json.dumps({
+            "text": text, "speech_text": None, "draft_bill": None,
+            "document_ready": None, "draft_action": None, "draft_document": None,
+        })
+
+    def test_optimistic_send_claim_gets_corrected(self):
+        optimistic = self._payload("On it — sending Ali's invoice now.")
+        with mock.patch("apps.chat.services.call_groq", return_value=optimistic):
+            reply = services.generate_reply(
+                business=self.business, conversation=self.conversation,
+                text="make an invoice for Ali and send it on whatsapp",
+            )
+        self.assertIn("isn't connected", reply.text)
+        self.assertIn("On it", reply.text)  # the original draft text is kept, not replaced
+
+    def test_no_notice_when_reply_already_addresses_whatsapp(self):
+        honest = self._payload("WhatsApp isn't connected yet for this business.")
+        with mock.patch("apps.chat.services.call_groq", return_value=honest):
+            reply = services.generate_reply(
+                business=self.business, conversation=self.conversation,
+                text="send Ali's invoice on whatsapp",
+            )
+        self.assertEqual(reply.text.count("WhatsApp"), 1)
+
+    def test_no_notice_for_unrelated_messages(self):
+        plain = self._payload("Sure, noted.")
+        with mock.patch("apps.chat.services.call_groq", return_value=plain):
+            reply = services.generate_reply(
+                business=self.business, conversation=self.conversation, text="thanks",
+            )
+        self.assertEqual(reply.text, "Sure, noted.")
 
 
 class HistoryReplayTests(TestCase):

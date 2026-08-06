@@ -1,5 +1,8 @@
 import json
 import logging
+import re
+
+from django.utils import timezone
 
 from apps.billing.models import Subscription
 from apps.billing.services import refund_feature_usage
@@ -41,6 +44,58 @@ FALLBACK_REPLIES = {
         "speech_text": "معذرت، ابھی اس کا جواب نہیں دے سکا — دوبارہ کوشش کریں۔",
     },
 }
+
+
+# "Undo that" / "galat tha, wapas karo" is handled deterministically, never by
+# the model: apps.sales.services.undo_pending_action already carries its own
+# safety (5-minute window, single-use claim via a conditional UPDATE), and
+# routing this through the LLM would mean trusting free text to decide
+# whether to revert a money record — exactly the class of decision this
+# codebase otherwise never lets the model make unsupervised. A regex catching
+# the intent and a direct service call is strictly safer than a prompt
+# instruction telling the model "call undo when they mean it."
+UNDO_INTENT_PATTERN = re.compile(
+    r"\bundo\b|\brevert\b|\bcancel that\b"
+    r"|\bwapas\b|\bulta\b|\bpehle wala\b"
+    r"|واپس|الٹا",
+    re.IGNORECASE,
+)
+
+UNDO_REPLIES = {
+    "en": {"done": "Done — that's reverted to what it was before.", "none": "Nothing to undo right now — the undo window may have expired."},
+    "ur": {"done": "ٹھیک ہے، پہلے جیسا کر دیا۔", "none": "ابھی واپس کرنے کے لیے کچھ نہیں ہے — وقت ختم ہو چکا ہوگا۔"},
+    "roman_ur": {"done": "Theek hai, pehle jaisa kar diya.", "none": "Abhi wapas karne ke liye kuch nahi hai — waqt khatam ho chuka hoga."},
+}
+
+
+def _try_handle_undo_intent(business, conversation, text, language):
+    """Returns an `ai_message` if this turn was handled as an undo request,
+    else None (meaning: proceed with the normal model turn). Kept separate
+    from generate_reply's main body so the model path is untouched when no
+    undo intent is present — this only short-circuits when the pattern hits."""
+    if not UNDO_INTENT_PATTERN.search(text or ""):
+        return None
+
+    from apps.sales import services as sales_services
+    from apps.sales.models import PendingUndo
+
+    pending = (
+        PendingUndo.objects.filter(business=business, used=False, expires_at__gt=timezone.now())
+        .order_by("-created_at")
+        .first()
+    )
+    localized = UNDO_REPLIES.get(language, UNDO_REPLIES["en"])
+    if pending is None:
+        reply_text = localized["none"]
+    else:
+        try:
+            sales_services.undo_pending_action(pending_undo=pending)
+            reply_text = localized["done"]
+        except ValueError:
+            reply_text = localized["none"]
+
+    ChatMessage.objects.create(conversation=conversation, sender="owner", text=text)
+    return ChatMessage.objects.create(conversation=conversation, sender="ai", text=reply_text)
 
 
 def _fallback_reply(language):
@@ -435,8 +490,13 @@ def _write_final_reply(user_message, execution_summary, language):
 
 def generate_reply(*, business, conversation, text, language=None):
     language = language or business.language
+
+    undo_message = _try_handle_undo_intent(business, conversation, text, language)
+    if undo_message is not None:
+        return undo_message
+
     history = _recent_history(conversation, _history_limit(business))
-    messages = prompt.build_messages(business, history, text, language=language)
+    messages = prompt.build_messages(business, history, text, language=language, conversation=conversation)
     tier = select_model_tier(text, language)
 
     reply_data = None
@@ -544,7 +604,95 @@ def generate_reply(*, business, conversation, text, language=None):
         ai_message.speech_text = final_speech or None
         ai_message.save(update_fields=["text", "speech_text"])
 
+    if not ai_failed and not agent_overwrote_text:
+        _enforce_whatsapp_not_connected_notice(business, ai_message, text, language)
+
+    if not ai_failed:
+        _attach_report_view(business, ai_message, text)
+
     return ai_message
+
+
+def _attach_report_view(business, ai_message, owner_text):
+    """Deterministically attaches `report_view` whenever the owner's message
+    named a date/range together with query intent ("pichle hafte ki detail
+    batao", "10 se 20 tareek ka hisaab") — the mobile app then shows a "View"
+    button that fetches the real entries directly from the ledger
+    (GET /sales/entries/), rather than trusting anything the model
+    summarized in "text". Deliberately not gated on anything the model
+    itself produced: prompt-compliance is exactly what this codebase has
+    repeatedly found unreliable for facts (dates, delivery status, DB
+    contents — see this module's other deterministic checks), and a period
+    query is the highest-stakes case yet, since the "detail" being asked
+    about spans many customers at once.
+    """
+    text = owner_text or ""
+    if not (prompt.QUERY_HINT_PATTERN.search(text) or prompt.BALANCE_HINT_PATTERN.search(text)):
+        return
+    date_range = prompt.extract_date_range_from_text(text)
+    if date_range is None:
+        return
+
+    date_from, date_to = date_range
+    summary = (
+        f"Details for {date_from.isoformat()}"
+        if date_from == date_to
+        else f"Details from {date_from.isoformat()} to {date_to.isoformat()}"
+    )
+    ai_message.report_view = {
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "summary": summary,
+    }
+    ai_message.save(update_fields=["report_view"])
+
+
+# Same intent signal apply_safe_document_send's agent layer already reacts
+# to for the doc types it can auto-compose — reused here as a deterministic
+# backstop for every OTHER path that can claim a send: a draft_bill's own
+# text (never routed through the agent layer at all) and any plain-text
+# reply. The model is told in the prompt to say plainly when WhatsApp isn't
+# connected, but a small model occasionally still writes "bhej raha hoon"
+# regardless — a fact this codebase already refuses to leave to the model
+# everywhere else (dates, balances, delivery status) gets the same treatment
+# here: checked and, if wrong, corrected server-side, never just hoped for.
+_WHATSAPP_MENTION_PATTERN = re.compile(
+    r"whatsapp|واٹس ایپ|واٹساپ",
+    re.IGNORECASE,
+)
+
+_NOT_CONNECTED_NOTICES = {
+    "en": " (WhatsApp isn't connected for this business yet — connect it in Settings before anything can be sent.)",
+    "ur": " (اس بزنس کے لیے واٹس ایپ منسلک نہیں ہے — کچھ بھی بھیجنے سے پہلے سیٹنگز میں جا کر منسلک کریں۔)",
+    "roman_ur": " (Is business ke liye WhatsApp connect nahi hai — kuch bhi bhejne se pehle Settings mein ja kar connect karein.)",
+}
+
+
+def _enforce_whatsapp_not_connected_notice(business, ai_message, owner_text, language):
+    """If the owner's message asked for something to be sent and WhatsApp
+    was never connected at all (no gateway_session_id — the one fact this
+    codebase treats as fully decisive, see prompt.build_business_context),
+    the reply must say so plainly. Appends rather than replaces: the draft
+    itself (bill figures, document summary) is still correct and useful,
+    only the sending claim needs correcting."""
+    if business.gateway_session_id:
+        return
+    if not prompt.DOCUMENT_HINT_PATTERN.search(owner_text or ""):
+        return
+    current_text = ai_message.text or ""
+    if _WHATSAPP_MENTION_PATTERN.search(current_text):
+        # The reply already talks about WhatsApp/connection status in some
+        # form — trust it rather than bolting on a second, possibly
+        # redundant sentence. This only fires to fill a genuine silence.
+        return
+
+    notice = _NOT_CONNECTED_NOTICES.get(language, _NOT_CONNECTED_NOTICES["en"])
+    ai_message.text = current_text + notice
+    if language == "roman_ur":
+        urdu_notice = to_urdu_script(_NOT_CONNECTED_NOTICES["roman_ur"].strip(" ()"))
+        if urdu_notice and ai_message.speech_text:
+            ai_message.speech_text = f"{ai_message.speech_text} {urdu_notice}"
+    ai_message.save(update_fields=["text", "speech_text"])
 
 
 def apply_safe_document_send(business, conversation, ai_message, reply_data, language):

@@ -101,6 +101,28 @@ class DraftDocumentSerializer(serializers.Serializer):
         return attrs
 
 
+class DraftCustomerSerializer(serializers.Serializer):
+    """An AI-proposed *new* customer — "naya customer banao: Bilal, 0300...".
+
+    Deliberately safe-tier (a Customer row, no money moves) but still
+    confirm-gated like every other draft: the model's read of a name/phone
+    is not trusted straight onto the customer list, both because OCR/dictation
+    can misread digits and because two owners saying the same name a slightly
+    different way must not silently produce two rows for the same person.
+    `candidate_ids` carries near-duplicate existing customers (found the same
+    way a photographed bill's name is matched — see
+    apps.image_info_extractor.matching) so the confirm screen can say "did you
+    mean an existing customer?" instead of the owner discovering the
+    duplicate only when a balance looks wrong weeks later.
+    """
+
+    name = serializers.CharField()
+    phone = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    opening_balance = serializers.FloatField(required=False, default=0)
+    candidate_ids = serializers.ListField(child=serializers.CharField(), required=False)
+    summary = serializers.CharField()
+
+
 class AiReplySerializer(serializers.Serializer):
     text = serializers.CharField()
     speech_text = serializers.CharField(allow_null=True, required=False, allow_blank=True)
@@ -108,15 +130,17 @@ class AiReplySerializer(serializers.Serializer):
     document_ready = DocumentReadySerializer(allow_null=True, required=False)
     draft_action = DraftActionSerializer(allow_null=True, required=False)
     draft_document = DraftDocumentSerializer(allow_null=True, required=False)
+    draft_customer = DraftCustomerSerializer(allow_null=True, required=False)
 
     def validate(self, attrs):
         present = [
-            k for k in ("draft_bill", "document_ready", "draft_action", "draft_document")
+            k for k in ("draft_bill", "document_ready", "draft_action", "draft_document", "draft_customer")
             if attrs.get(k)
         ]
         if len(present) > 1:
             raise serializers.ValidationError(
-                "draft_bill, document_ready, draft_action and draft_document are mutually exclusive."
+                "draft_bill, document_ready, draft_action, draft_document and draft_customer "
+                "are mutually exclusive."
             )
         return attrs
 
@@ -141,6 +165,8 @@ class ChatMessageSerializer(serializers.ModelSerializer):
             "document_ready",
             "draft_action",
             "draft_document",
+            "draft_customer",
+            "report_view",
             "pending_delivery_id",
             "is_error_fallback",
             "timestamp",

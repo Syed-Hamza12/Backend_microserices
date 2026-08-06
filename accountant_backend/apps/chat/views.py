@@ -14,7 +14,9 @@ from apps.accounts.models import Business
 from apps.billing.permissions import HasFeature
 from apps.billing.services import enforce_feature_gate
 from apps.customers.models import Customer
+from apps.customers.phone import normalize_phone
 from apps.documents import services as document_services
+from apps.image_info_extractor import matching
 from apps.sales import services as sales_services
 from apps.sales.models import ActivityEntry
 from apps.sales.business_date import BusinessDateError, resolve as resolve_business_date, to_entry_timestamp
@@ -874,6 +876,106 @@ class ConfirmDraftDocumentView(APIView):
                         "date_from": date_from.isoformat() if date_from else None,
                         "date_to": date_to.isoformat() if date_to else None,
                     },
+                },
+            }
+        )
+
+
+class ConfirmDraftCustomerView(APIView):
+    """Confirms an AI-proposed *new* customer (`draft_customer`).
+
+    The model was told to check for near-duplicates before proposing this at
+    all (see prompt.py's NEW CUSTOMERS section), but the model's own check is
+    advisory, not a safeguard — this is the actual gate. It re-runs the exact
+    same fuzzy matcher a photographed bill's customer name goes through
+    (apps.image_info_extractor.matching), and refuses to create a customer
+    when a close match already exists, the same "ask, don't guess" rule as
+    everywhere else money-adjacent in this codebase. A new customer is safe
+    to auto-approve on ambiguity in neither direction: creating a duplicate
+    silently fragments that person's ledger across two rows forever.
+    """
+
+    def post(self, request, message_id):
+        try:
+            business = request.user.business
+        except Business.DoesNotExist:
+            return Response(
+                {"success": False, "error": {"code": "NO_BUSINESS", "message": "No business created yet."}},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            message = ChatMessage.objects.get(pk=message_id, conversation__business=business, sender="ai")
+        except ChatMessage.DoesNotExist:
+            return Response(
+                {"success": False, "error": {"code": "NOT_FOUND", "message": "Message not found."}},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not message.draft_customer:
+            return Response(
+                {"success": False, "error": {"code": "NO_DRAFT_CUSTOMER", "message": "This message has no new customer proposal."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        claimed = ChatMessage.objects.filter(pk=message.pk, draft_confirmed=False).update(draft_confirmed=True)
+        if not claimed:
+            return Response(
+                {"success": False, "error": {"code": "ALREADY_CONFIRMED", "message": "This was already confirmed."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        message.draft_confirmed = True
+
+        draft = message.draft_customer
+        name = (draft.get("name") or "").strip()
+        if not name:
+            _release_draft_claim(message)
+            return Response(
+                {"success": False, "error": {"code": "INVALID_DRAFT", "message": "No name given for the new customer."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        existing, candidates = matching.find_matching_customer(business, name)
+        if existing is not None or candidates:
+            _release_draft_claim(message)
+            names = ", ".join(c.name for c in ([existing] if existing else candidates))
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": "POSSIBLE_DUPLICATE",
+                        "message": f"This looks like it might already be an existing customer ({names}) — "
+                        "check before adding a new one.",
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            opening_balance = Decimal(str(draft.get("opening_balance") or 0)).quantize(Decimal("0.01"))
+        except InvalidOperation:
+            opening_balance = Decimal("0")
+        # A stated opening balance may be a real debt the customer already
+        # carries — no positive-only floor here (unlike a sale line item,
+        # which MIN_MONEY governs). Only the absurd-magnitude ceiling applies.
+        if opening_balance > MAX_MONEY or opening_balance < -MAX_MONEY:
+            opening_balance = Decimal("0")
+
+        customer = Customer.objects.create(
+            business=business,
+            name=name,
+            phone=normalize_phone(draft.get("phone") or ""),
+            opening_balance=opening_balance,
+            current_balance=opening_balance,
+            projected_balance=opening_balance,
+        )
+
+        return Response(
+            {
+                "success": True,
+                "data": {
+                    "message": ChatMessageSerializer(message).data,
+                    "customer_id": customer.id,
                 },
             }
         )

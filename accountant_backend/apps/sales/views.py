@@ -87,6 +87,53 @@ class CustomerHistoryView(APIView):
         return Response(paginated_response(ActivityEntrySerializer, entries, request))
 
 
+class EntriesInRangeView(APIView):
+    """Every entry across ALL customers in a date range — backs the chat
+    "View" button on a `report_view` card (apps.chat.services._attach_report_view)
+    for period questions like "pichle hafte ki detail batao" or "10 se 20
+    tareek ka hisaab", where a business owner wants to see everyone who
+    bought something in a window, not one customer's ledger. `date_from`/
+    `date_to` are required and re-validated the same way every other date in
+    this codebase is — never trusted as a raw string straight into a query.
+    """
+
+    def get(self, request):
+        business, error = _business_or_error(request)
+        if error:
+            return error
+
+        from apps.sales.business_date import BusinessDateError, resolve as resolve_business_date
+
+        raw_from = request.query_params.get("date_from")
+        raw_to = request.query_params.get("date_to")
+        if not raw_from or not raw_to:
+            return Response(
+                {"success": False, "error": {"code": "INVALID_RANGE", "message": "date_from and date_to are required."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            date_from = resolve_business_date(raw_from)
+            date_to = resolve_business_date(raw_to)
+        except BusinessDateError as exc:
+            return Response(
+                {"success": False, "error": {"code": "INVALID_RANGE", "message": str(exc)}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if date_from is None or date_to is None or date_from > date_to:
+            return Response(
+                {"success": False, "error": {"code": "INVALID_RANGE", "message": "date_from must be on or before date_to."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        entries = (
+            ActivityEntry.objects.filter(business=business, timestamp__date__range=(date_from, date_to))
+            .select_related("customer")
+            .prefetch_related("line_items")
+            .order_by("-timestamp", "-id")
+        )
+        return Response(paginated_response(ActivityEntrySerializer, entries, request))
+
+
 class DashboardSummaryView(APIView):
     """Business-at-a-glance figures for the Home tab.
 

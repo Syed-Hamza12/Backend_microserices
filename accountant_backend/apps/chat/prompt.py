@@ -1,5 +1,5 @@
 import re
-from datetime import date
+from datetime import date, timedelta
 
 from django.utils import timezone
 
@@ -31,8 +31,16 @@ You convert Roman Urdu (Urdu written in Latin letters) into native Urdu script.
 Reply with ONLY the converted text — no quotes, no explanation, no translation into English.
 This text is read aloud by a speech synthesiser, so write exactly what should be spoken.
 "Bill ban gaya hai, total 25000 rupay" becomes "بل بن گیا ہے، ٹوٹل 25000 روپے".
-Keep digits as digits. Leave English product names and words that Urdu speakers say in English
-(like "black", "total", "balance") in Latin letters if they have no natural Urdu spelling."""
+"WhatsApp connect nahi hai" becomes "واٹس ایپ کنیکٹ نہیں ہے".
+Keep digits as digits. Every other word, INCLUDING English business/product terms with no natural
+Urdu spelling ("total", "balance", "connect", "WhatsApp", "confirm", "cash", "bank", "black"),
+MUST be written out in Urdu script too, spelled the way it actually sounds — never leave a Latin
+word or fragment sitting inside the Urdu-script text. The speech synthesiser reads Urdu script one
+way and Latin letters a completely different way; a stray Latin word inside otherwise-Urdu text is
+sounded out letter by letter and comes out as noise, not the word ("connect" has been heard back as
+"co-ni-cet"). If you are unsure how a loanword is normally written in Urdu, spell it phonetically in
+Urdu script rather than falling back to Latin — a slightly-off Urdu spelling is spoken far more
+correctly than any Latin text mixed into this field."""
 
 # These patterns decide which model a message gets, so they must recognise the
 # intent in every language the app offers. They were English-only with \b word
@@ -94,6 +102,245 @@ BALANCE_HINT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Whole-business aggregate questions — "who owes me the most", "total
+# outstanding" — name no single customer, so build_entry_context's whole-word
+# customer match never fires for them and there was previously no capability
+# that could answer them at all. The model was left to sum whatever handful
+# of customers happened to be in build_business_context's top-10-recent list,
+# silently ignoring everyone else — indistinguishable from a real answer
+# unless you already knew it was wrong. This is computed and injected as fact
+# instead, the same fix as the per-customer entry lookups.
+AGGREGATE_HINT_PATTERN = re.compile(
+    r"\btotal outstanding\b|\bwho owes\b|\bmost\b.*\bowe\b|\bowes the most\b|\ball customers\b"
+    # Roman Urdu
+    r"|\bsab ka\b|\bkitno\b.*\bbaaki\b|\bsabse zyada\b|\bzyada baaki\b",
+    re.IGNORECASE,
+)
+
+
+def needs_aggregate_context(message_text: str) -> bool:
+    return bool(AGGREGATE_HINT_PATTERN.search(message_text or ""))
+
+
+def build_aggregate_context(business):
+    """The real, whole-business outstanding total and the top debtors — see
+    AGGREGATE_HINT_PATTERN's comment for why this can't be left to the model
+    to sum from the partial customer list in build_business_context."""
+    customers = (
+        Customer.objects.filter(business=business, current_balance__gt=0)
+        .order_by("-current_balance")[:10]
+    )
+    total = sum(c.current_balance for c in customers)
+    all_positive_total = (
+        Customer.objects.filter(business=business, current_balance__gt=0)
+        .values_list("current_balance", flat=True)
+    )
+    grand_total = sum(all_positive_total) if all_positive_total else 0
+    if not customers:
+        return "\n\nTotal outstanding across all customers: 0. No customer currently owes anything."
+    lines = ", ".join(f"{wrap_untrusted(c.name)}={c.current_balance}" for c in customers)
+    return (
+        f"\n\nTotal outstanding across ALL customers: {grand_total}. "
+        f"Top customers by amount owed (this is the complete, authoritative ranking — "
+        f"do not guess or use the smaller 'Recent customers' list above for this): {lines}"
+    )
+
+
+# Factual questions about existing records — "what did X buy", "detail of
+# bills", "which items" — were not covered by any hint pattern above, so
+# needs_entry_context() never fired and the model answered from nothing but
+# its own chat-history recall. Since it has no real memory of numbers it
+# never saw, it filled in a plausible-looking amount and item — a different
+# one on each ask, for the same question. Answers to factual DB questions
+# must always come from build_entry_context, never from the model's memory.
+QUERY_HINT_PATTERN = re.compile(
+    r"\bdetail\b|\bdetails\b|\bitem\b|\bitems\b|\btook\b|\bbought\b|\bpurchased\b"
+    r"|\bwhat did\b|\bwhich\b.*\bbuy\b|\bshow\b|\blist\b"
+    # Roman Urdu
+    r"|\btafseel\b|\btafseel\b|\blia\b|\bliya\b|\bkharida\b|\bkya\b.*\blia\b|\bbatao\b|\bbatayein\b",
+    re.IGNORECASE,
+)
+
+#: Month names/abbreviations -> month number, for parsing a date mentioned in
+#: free text ("2 aug", "aug 2"). The model is never trusted to resolve this
+#: itself — see apps.sales.business_date's module docstring for why.
+_MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+_MONTH_NAMES_RE = "|".join(_MONTHS)
+_DATE_DAY_MONTH_RE = re.compile(r"\b(\d{1,2})\s*(?:st|nd|rd|th)?\s+(" + _MONTH_NAMES_RE + r")\b", re.IGNORECASE)
+_DATE_MONTH_DAY_RE = re.compile(r"\b(" + _MONTH_NAMES_RE + r")\s+(\d{1,2})\b", re.IGNORECASE)
+
+# "2 tareek ka bill" / "5 tareekh" — the ordinary Roman Urdu way to name a day
+# of the CURRENT (or most recently past) month, with no month word at all.
+# Missing this pattern is what let a real query fail: "Pap ka 2 tareek ka
+# bill batao" ("tell me Pap's bill from the 2nd") was read by the model as
+# "do tareekh" — TWO dates — because "2 tareek" without an explicit month is
+# a construction this parser didn't recognise at all, so needs_entry_context
+# never fired and the question was answered from the model's own (wrong)
+# reading instead of a real, date-filtered lookup.
+#
+# Spelling is NOT standardized in Roman Urdu — the same word arrives typed as
+# "tareek", "tareekh", "tarikh", "tarkeeh", "tarikeeh" (voice-to-text is even
+# less consistent). A fixed list of exact spellings missed "tarkeeh" on a
+# real message and silently fell through to hallucination again, so this
+# matches the shape of the word instead: "tar" + up to a few vowels + "k" +
+# up to a few trailing letters. Urdu script کا تاریخ is not handled here — it
+# goes through a different (native-script) input path.
+_TAREEK_WORD_RE = r"tar[a-z]{0,6}k[a-z]{0,3}"
+_DATE_TAREEK_RE = re.compile(r"\b(\d{1,2})\s*(?:" + _TAREEK_WORD_RE + r")\b", re.IGNORECASE)
+
+
+def _most_recent_day_of_month(day, today):
+    """The most recent real calendar date matching this day-of-month, at or
+    before `today` — "2 tareek" with no month said always means the nearest
+    2nd that's already happened, never a future one still to come."""
+    try:
+        candidate = date(today.year, today.month, day)
+    except ValueError:
+        candidate = None
+    if candidate is not None and candidate <= today:
+        return candidate
+    year, month = today.year, today.month
+    year, month = (year - 1, 12) if month == 1 else (year, month - 1)
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _extract_date_from_text(message_text, today=None):
+    """A specific calendar date mentioned in the message ("2 aug", "aug 2",
+    "2 tareek"), resolved to a `date`, or None if the message doesn't name
+    one. Deliberately narrow — day(+month) only, no bare weekday/relative
+    phrases here, since those are for the model to pass through
+    `business_date.resolve` on drafting turns, not for filtering a
+    read-only lookup."""
+    from apps.sales import business_date
+
+    text = message_text or ""
+    today = today or business_date.business_today()
+
+    tareek_match = _DATE_TAREEK_RE.search(text)
+    if tareek_match:
+        day = int(tareek_match.group(1))
+        if 1 <= day <= 31:
+            return _most_recent_day_of_month(day, today)
+
+    match = _DATE_DAY_MONTH_RE.search(text) or _DATE_MONTH_DAY_RE.search(text)
+    if not match:
+        return None
+    groups = match.groups()
+    day, month_name = (groups[0], groups[1]) if groups[0].isdigit() else (groups[1], groups[0])
+    month = _MONTHS.get(month_name.lower())
+    if month is None:
+        return None
+    year = today.year
+    try:
+        candidate = date(year, month, int(day))
+    except ValueError:
+        return None
+    # A day/month mentioned with no year almost always means the most recent
+    # occurrence, not one still to come this year.
+    if candidate > today:
+        try:
+            candidate = date(year - 1, month, int(day))
+        except ValueError:
+            return None
+    return candidate
+
+
+# Same spelling-tolerance problem as _TAREEK_WORD_RE: "pichle" arrives typed
+# as "pichle"/"pichlay"/"pichla"/"picle"/"pichhle", and "mahine"/"hafte" have
+# their own variants ("mahina", "maheene", "hafta", "haftay"). A real message
+# ("picle mahine ki 10 tarkeeh se...") silently failed to anchor to last
+# month with the exact-spelling version of this pattern — same failure mode,
+# same fix: match the shape of the word, not one fixed spelling of it.
+_PREVIOUS_WORD_RE = r"pi[a-z]*l[a-z]{0,2}"
+_LAST_WEEK_PATTERN = re.compile(
+    r"\b" + _PREVIOUS_WORD_RE + r"\s+haft[a-z]{0,2}\b|\bgaye\s+haft[a-z]{0,2}\b|\blast week\b",
+    re.IGNORECASE,
+)
+_LAST_MONTH_PATTERN = re.compile(
+    r"\b" + _PREVIOUS_WORD_RE + r"\s+mah[a-z]{0,4}\b|\bgaye\s+mah[a-z]{0,4}\b|\blast month\b",
+    re.IGNORECASE,
+)
+# "10 se 20 tareek" / "10 tareek se 20 tareekh tak" — a day RANGE, the month
+# assumed from context (current month, or last month if "pichle mahine ki"
+# also appears in the same message).
+_RANGE_TAREEK_PATTERN = re.compile(
+    r"\b(\d{1,2})\s*(?:" + _TAREEK_WORD_RE + r")?\s*(?:se|to|from)\s*(?:lekar|lekr)?\s*"
+    r"(\d{1,2})\s*(?:" + _TAREEK_WORD_RE + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _last_calendar_week(today):
+    """The most recently COMPLETED Monday-Sunday week, strictly before the
+    current one — "pichle hafte" means the week that already finished, never
+    a partial week including today."""
+    this_monday = today - timedelta(days=today.weekday())
+    last_sunday = this_monday - timedelta(days=1)
+    last_monday = last_sunday - timedelta(days=6)
+    return last_monday, last_sunday
+
+
+def _previous_month_bounds(today):
+    first_of_this_month = today.replace(day=1)
+    last_of_prev_month = first_of_this_month - timedelta(days=1)
+    return last_of_prev_month.replace(day=1), last_of_prev_month
+
+
+def extract_date_range_from_text(message_text, today=None):
+    """A date RANGE named in the message: "pichle hafte" (last calendar
+    week), "pichle mahine" (last calendar month), "10 se 20 tareek" (a day
+    range — within the current month, or last month if "pichle mahine ki"
+    also appears), or a single date (from `_extract_date_from_text`, widened
+    to a same-day range). Returns `(date_from, date_to)` or None.
+
+    Same principle as every other date helper here: resolved once,
+    deterministically, server-side — never left to the model's own
+    arithmetic, which is exactly where "pichle mahine ki 10 se 20 tareekh"
+    would otherwise go wrong (which month is "10", which is "20", does the
+    range even span a month boundary).
+    """
+    from apps.sales import business_date
+
+    text = message_text or ""
+    today = today or business_date.business_today()
+
+    if _LAST_WEEK_PATTERN.search(text):
+        return _last_calendar_week(today)
+
+    if _LAST_MONTH_PATTERN.search(text) and not _RANGE_TAREEK_PATTERN.search(text):
+        return _previous_month_bounds(today)
+
+    range_match = _RANGE_TAREEK_PATTERN.search(text)
+    if range_match:
+        day_from, day_to = int(range_match.group(1)), int(range_match.group(2))
+        if 1 <= day_from <= 31 and 1 <= day_to <= 31:
+            if _LAST_MONTH_PATTERN.search(text):
+                anchor, _ = _previous_month_bounds(today)
+            else:
+                anchor = today.replace(day=1)
+            try:
+                start = date(anchor.year, anchor.month, day_from)
+                end = date(anchor.year, anchor.month, day_to)
+            except ValueError:
+                return None
+            if start > end:
+                start, end = end, start
+            return start, end
+
+    single = _extract_date_from_text(text, today=today)
+    if single is not None:
+        return single, single
+    return None
+
+
 # Ceiling on how many customers' ledgers one message can pull into context.
 MAX_CONTEXT_CUSTOMERS = 3
 
@@ -148,6 +395,13 @@ matching exactly this shape, no other text outside the JSON:
       "payment_method" (payments: cash|bank|jazzcash|easypaisa),
     "summary": "string - plain-language description of exactly what will change, shown to the
       owner before they confirm, e.g. 'Change the 5,000 PKR sale on 12 Jul from Ali to Bank payment'"
+  },
+  "draft_customer": null or {
+    "name": "string - required, the new customer's name exactly as the owner said it",
+    "phone": "string or null - only if the owner gave one",
+    "opening_balance": "number, default 0 - ONLY if the owner explicitly stated an existing balance
+      this customer already owes/is owed, e.g. 'purana 5000 baaki hai uska'",
+    "summary": "string - e.g. 'Add new customer Bilal, 0300-1234567'"
   }
 }
 DATES. Entries may be dated in the past, today, or the future — a future date is a planned bill,
@@ -157,6 +411,11 @@ When they don't mention a date at all, leave it out — that means today. Never 
 
 If the owner says "kal" (which in Urdu means BOTH yesterday and tomorrow), do NOT pick one. Set
 draft_bill to null and ask in "text" which they mean, naming both dates.
+
+"N tareek"/"tareekh"/"tarikh" ("2 tareek ka bill batao", "5 tareekh ki entry") names ONE single day
+of the current (or most recently past) month — the Nth of that month, not "N dates" or "N different
+bills". "2 tareek" is "the 2nd", exactly like "on the 2nd" in English — it is never a count. Treat it
+the same as a day+month date once you also assume the current month.
 
 DOCUMENTS. When they ask for a statement or report over a period ("statement from 1 July to 31
 July", "is mahine ki report"), use draft_document with date_from/date_to.
@@ -182,9 +441,18 @@ context. You have no way to know or construct a URL. NEVER write one yourself, n
 or a path, and never use document_ready for something you were asked to produce — that is always
 draft_document.
 
-draft_bill, document_ready, draft_document and draft_action are mutually exclusive and all optional
-(null when not applicable - many replies have none of them, just text). A reply carrying more than
-one is rejected outright and the owner sees nothing. Keep replies short and WhatsApp-style.
+NEW CUSTOMERS. "naya customer banao: Bilal, 0300-1234567", "add a customer called Sara" — use
+draft_customer. First check the "Recent customers" list above: if a name close to what the owner
+said may already be the same person, do NOT create a second row for them — ask instead ("Do you
+mean the existing Bilal, or is this a different person?"), the same way a photographed bill's
+unclear name is asked about rather than guessed. Only set draft_customer when this is genuinely a
+new person. The server re-checks for near-duplicates before creating anything regardless, so this
+is about avoiding an unnecessary question, not the only safeguard.
+
+draft_bill, document_ready, draft_document, draft_action and draft_customer are mutually exclusive
+and all optional (null when not applicable - many replies have none of them, just text). A reply
+carrying more than one is rejected outright and the owner sees nothing. Keep replies short and
+WhatsApp-style.
 
 SENDING. When the owner asks you to send a statement, report, invoice or bill to a customer on
 WhatsApp, that IS something you set up: you fill in draft_document (or draft_bill), and the server
@@ -332,7 +600,12 @@ def needs_reasoning(message_text: str) -> bool:
 
 def needs_entry_context(message_text: str) -> bool:
     text = message_text or ""
-    return bool(EDIT_HINT_PATTERN.search(text) or BALANCE_HINT_PATTERN.search(text))
+    return bool(
+        EDIT_HINT_PATTERN.search(text)
+        or BALANCE_HINT_PATTERN.search(text)
+        or QUERY_HINT_PATTERN.search(text)
+        or extract_date_range_from_text(text) is not None
+    )
 
 
 def build_business_context(business):
@@ -393,7 +666,8 @@ def build_entry_context(business, message_text):
     # customer's entries as candidates for an edit. Short names made it worse:
     # a customer called "A" matched literally every message.
     words = set(re.findall(r"\w+", (message_text or "").lower()))
-    if not words:
+    mentioned_range = extract_date_range_from_text(message_text)
+    if not words and mentioned_range is None:
         return ""
 
     matched_customers = []
@@ -408,37 +682,65 @@ def build_entry_context(business, message_text):
         if all(word in words for word in name_words):
             matched_customers.append(customer)
 
-    if not matched_customers:
-        return ""
-
-    # Several customers matching means the message is ambiguous. Feeding all of
-    # their ledgers in invites the model to pick one; the contract instructions
-    # tell it to ask instead, and this keeps the context honest about that.
-    matched_customers = matched_customers[:MAX_CONTEXT_CUSTOMERS]
+    def _entry_line(e, customer_name, customer_id):
+        when = timezone.localtime(e.timestamp).date().isoformat()
+        if e.type == "sale":
+            # Item names can come from OCR of a document someone else wrote,
+            # so they carry the untrusted marker like customer names do.
+            items = ", ".join(f"{wrap_untrusted(li.item_name)} x{li.quantity}" for li in e.line_items.all())
+            detail = f"sale of {e.amount} ({items})" if items else f"sale of {e.amount}"
+        else:
+            detail = f"payment of {e.amount} via {e.payment_method or 'unspecified'}"
+        return (
+            f"entry_id={e.id} customer_id={customer_id} "
+            f"customer={wrap_untrusted(customer_name)} date={when} {detail}"
+        )
 
     lines = []
-    for customer in matched_customers:
+    if matched_customers:
+        # Several customers matching means the message is ambiguous. Feeding all of
+        # their ledgers in invites the model to pick one; the contract instructions
+        # tell it to ask instead, and this keeps the context honest about that.
+        matched_customers = matched_customers[:MAX_CONTEXT_CUSTOMERS]
+        for customer in matched_customers:
+            entries = ActivityEntry.objects.filter(business=business, customer=customer)
+            # A date/range named in the message ("what did Pap buy on 2 Aug",
+            # "pichle hafte") narrows to it instead of "last 15 regardless of
+            # when" — the earlier cutoff could silently drop the entries
+            # being asked about while still returning fifteen irrelevant
+            # ones, which is exactly the shape of context that produces a
+            # confident, invented answer instead of "nothing in that range."
+            if mentioned_range is not None:
+                date_from, date_to = mentioned_range
+                entries = entries.filter(timestamp__date__range=(date_from, date_to)).order_by("-timestamp")
+            else:
+                entries = entries.order_by("-timestamp")[:15]
+            for e in entries:
+                lines.append(_entry_line(e, customer.name, customer.id))
+    elif mentioned_range is not None:
+        # No customer named, but a date/range was ("detail of bills of 2
+        # aug, which customer took what item", "pichle hafte ki detail") —
+        # scan that range across the whole business rather than returning
+        # nothing and letting the model guess. Bounded the same way a
+        # matched-customer lookup is, but generous — a week/month view is
+        # exactly the case a business owner wants to see everyone in.
+        date_from, date_to = mentioned_range
         entries = (
-            ActivityEntry.objects.filter(business=business, customer=customer)
-            .order_by("-timestamp")[:15]
+            ActivityEntry.objects.filter(business=business, timestamp__date__range=(date_from, date_to))
+            .select_related("customer")
+            .order_by("-timestamp")[:60]
         )
         for e in entries:
-            when = timezone.localtime(e.timestamp).date().isoformat()
-            if e.type == "sale":
-                # Item names can come from OCR of a document someone else wrote,
-                # so they carry the untrusted marker like customer names do.
-                items = ", ".join(f"{wrap_untrusted(li.item_name)} x{li.quantity}" for li in e.line_items.all())
-                detail = f"sale of {e.amount} ({items})" if items else f"sale of {e.amount}"
-            else:
-                detail = f"payment of {e.amount} via {e.payment_method or 'unspecified'}"
-            lines.append(
-                f"entry_id={e.id} customer_id={customer.id} "
-                f"customer={wrap_untrusted(customer.name)} date={when} {detail}"
-            )
+            lines.append(_entry_line(e, e.customer.name, e.customer.id))
 
     if not lines:
+        if mentioned_range is not None:
+            date_from, date_to = mentioned_range
+            label = date_from.isoformat() if date_from == date_to else f"{date_from.isoformat()} to {date_to.isoformat()}"
+            return f"\n\nNo entries found for {label}. Say so plainly — do not invent one."
         return ""
-    return "\n\nRecent entries for customers mentioned in this message:\n" + "\n".join(lines)
+    return "\n\nRecent entries relevant to this message (this is the complete, authoritative record — " \
+        "do not add, guess, or recall any entry not listed here):\n" + "\n".join(lines)
 
 
 #: Appended for Roman Urdu businesses. "Reply in Roman Urdu" alone was not
@@ -469,7 +771,53 @@ SCRIPT_RULES = {
 }
 
 
-def build_system_prompt(business, message_text="", language=None):
+def build_current_draft_context(conversation):
+    """The single most recent not-yet-confirmed draft in this conversation,
+    stated explicitly and unambiguously — regardless of whether it still
+    falls inside the truncated chat-history window sent to the model.
+
+    Without this, "the current draft" existed only implicitly, as whatever the
+    model inferred by re-reading its own past JSON replies in the history list
+    (see build_messages). That works while the draft is recent, but a plan
+    truncates history to a small message count (see services._history_limit),
+    so an older draft simply fell out of what the model ever saw — and it
+    either claimed no draft existed or, worse, treated the newest *mentioned*
+    JSON blob (which can be a stale/cancelled one still sitting in-window) as
+    current. Querying the database directly for "the latest unconfirmed
+    draft" is authoritative in a way that context-window recall never is.
+    """
+    message = (
+        conversation.messages
+        .filter(sender="ai", draft_confirmed=False)
+        .exclude(draft_bill=None, draft_action=None, draft_document=None, draft_customer=None)
+        .order_by("-timestamp", "-id")
+        .first()
+    )
+    if message is None:
+        return ""
+
+    if message.draft_bill:
+        kind, payload = "bill", message.draft_bill
+    elif message.draft_action:
+        kind, payload = "action", message.draft_action
+    elif message.draft_document:
+        kind, payload = "document", message.draft_document
+    elif message.draft_customer:
+        kind, payload = "customer", message.draft_customer
+    else:
+        return ""
+
+    import json as _json
+
+    return (
+        f"\n\nCURRENT ACTIVE DRAFT (id={message.id}, type={kind}, not yet confirmed by the owner): "
+        f"{_json.dumps(payload)}. When the owner refers to \"the draft\", \"it\", \"that bill\", or asks "
+        "to confirm/edit/send without naming a new one, THIS is the draft they mean — do not invent a "
+        "different one and do not claim no draft exists."
+    )
+
+
+def build_system_prompt(business, message_text="", language=None, conversation=None):
     """`language` is the owner's live Settings choice, sent with each request.
 
     It is stated explicitly and repeated, because the model otherwise mirrors
@@ -480,6 +828,8 @@ def build_system_prompt(business, message_text="", language=None):
     language = language or business.language
     language_name = LANGUAGE_NAMES.get(language, "English")
     entry_context = build_entry_context(business, message_text) if needs_entry_context(message_text) else ""
+    aggregate_context = build_aggregate_context(business) if needs_aggregate_context(message_text) else ""
+    draft_context = build_current_draft_context(conversation) if conversation is not None else ""
     script_rule = SCRIPT_RULES.get(language, ENGLISH_SCRIPT_RULE)
     return (
         f"{OUTPUT_CONTRACT_INSTRUCTIONS}\n\n"
@@ -490,14 +840,19 @@ def build_system_prompt(business, message_text="", language=None):
         f"{script_rule}\n\n"
         f"{build_business_context(business)}"
         f"{entry_context}"
+        f"{aggregate_context}"
+        f"{draft_context}"
     )
 
 
-def build_messages(business, history_messages, new_text, language=None):
+def build_messages(business, history_messages, new_text, language=None, conversation=None):
     """`history_messages` is an iterable of ChatMessage (owner/ai), oldest first, already
     trimmed to the plan's chat_history_limit by the caller."""
     messages = [
-        {"role": "system", "content": build_system_prompt(business, new_text, language=language)}
+        {
+            "role": "system",
+            "content": build_system_prompt(business, new_text, language=language, conversation=conversation),
+        }
     ]
     for msg in history_messages:
         role = "user" if msg.sender == "owner" else "assistant"
@@ -525,5 +880,6 @@ def _reply_to_json_string(msg):
             # got "taiyar hai", then "ready nahi hai", then "send nahi ho sakta"
             # for one unchanged request, and finally an invented document_url.
             "draft_document": msg.draft_document,
+            "draft_customer": msg.draft_customer,
         }
     )

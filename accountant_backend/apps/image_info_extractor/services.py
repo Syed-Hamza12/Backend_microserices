@@ -229,6 +229,11 @@ def handle_image_extract_job(job_task):
             # unmatched name can never quietly land on the wrong ledger.
             "customer_id": str(customer.id) if customer else None,
             "customer_name_guess": None if customer else (extracted.get("customer_name") or None),
+            # Near-miss matches the owner can pick from on the Edit Draft screen
+            # instead of retyping a name — additive field, ignored by older clients.
+            "customer_candidates": (
+                [{"id": str(c.id), "name": c.name} for c in candidates] if not customer else []
+            ),
             # Shown on the draft card and the Edit Draft screen — without it a
             # matched draft renders with a blank customer.
             "customer_name": customer.name if customer else "",
@@ -249,11 +254,22 @@ def handle_image_extract_job(job_task):
             )
         else:
             read_as = (extracted.get("customer_name") or "").strip()
-            reply_text = (
-                f"I read a bill for {business.currency_code} {amount}"
-                + (f' (the name looks like "{read_as}")' if read_as else "")
-                + ". Which customer is this for? Tap Edit on the draft to pick them, then confirm."
-            )
+            if candidates:
+                # The name on the bill was close to one or more existing customers but
+                # not decisively — naming them turns a guess into a one-tap answer
+                # instead of leaving the owner to retype a name from scratch.
+                names = ", ".join(c.name for c in candidates)
+                reply_text = (
+                    f"I read a bill for {business.currency_code} {amount}"
+                    + (f' (the name looks like "{read_as}")' if read_as else "")
+                    + f". Is this for {names}? Tap Edit on the draft to pick them, then confirm."
+                )
+            else:
+                reply_text = (
+                    f"I read a bill for {business.currency_code} {amount}"
+                    + (f' (the name looks like "{read_as}")' if read_as else "")
+                    + ". Which customer is this for? Tap Edit on the draft to pick them, then confirm."
+                )
         message = ChatMessage.objects.create(
             conversation=conversation,
             sender="ai",

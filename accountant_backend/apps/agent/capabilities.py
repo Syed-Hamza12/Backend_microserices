@@ -210,7 +210,16 @@ def _resolve_send_whatsapp_document(business, conversation, have):
 
     try:
         session = gateway_client.get_status(business.gateway_session_id)
-    except GatewayError:
+    except GatewayError as exc:
+        # GATEWAY_UNREACHABLE means OUR gateway service didn't answer — a
+        # backend-side outage, nothing the owner can fix from Settings. It
+        # was previously folded into the same "connect it in Settings"
+        # message as a genuinely unlinked phone, which sent the owner to
+        # tap a Settings button that does nothing for a problem on our end,
+        # and — worse — meant "gateway is down" and "you never connected
+        # WhatsApp" were indistinguishable from the reply text alone.
+        if exc.code == "GATEWAY_UNREACHABLE":
+            return Clarification("WhatsApp sending is temporarily unavailable — please try again shortly.")
         return Clarification("WhatsApp isn't connected for this business yet — connect it in Settings first.")
     if session.get("status") != "CONNECTED":
         return Clarification("WhatsApp isn't connected for this business yet — connect it in Settings first.")

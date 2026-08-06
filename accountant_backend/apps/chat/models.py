@@ -65,6 +65,22 @@ class ChatMessage(models.Model):
     # apps.chat.serializers.DraftDocumentSerializer. Confirmed by the owner like
     # any other draft; the server builds it from the ledger.
     draft_document = models.JSONField(null=True, blank=True)
+    # AI-proposed *new* customer — see apps.chat.serializers.DraftCustomerSerializer.
+    # Mutually exclusive with the three drafts above, same "only one of these,
+    # or none" rule, and confirmed the same way (ConfirmDraftCustomerView).
+    draft_customer = models.JSONField(null=True, blank=True)
+    # A date/date-range the owner asked about across MULTIPLE customers
+    # ("pichle hafte ki detail batao", "10 se 20 tareek ka hisaab") — set
+    # deterministically by apps.chat.services (never by the model, same
+    # reasoning as every other date fact in this codebase), whenever such a
+    # range was recognised in the owner's message. Purely informational: no
+    # confirm step, nothing it produces changes the ledger, so it can coexist
+    # with a draft_bill/draft_action/draft_document/draft_customer on the same
+    # message rather than being mutually exclusive with them. The mobile app
+    # renders a "View" button that fetches the matching entries directly
+    # (GET /sales/entries/?date_from=&date_to=) rather than trusting anything
+    # summarized in "text".
+    report_view = models.JSONField(null=True, blank=True)
     # Set when this reply auto-executed a safe capability that queued a
     # WhatsApp send (see apps.agent.executor) — the AI already acted, so this
     # is not another draft to confirm. The client polls this delivery's status
