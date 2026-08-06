@@ -243,6 +243,20 @@ GEMINI_TEXT_FALLBACK_MODELS = [
     if m.strip()
 ]
 
+# Chat's fast/planner tier (see apps.chat.services.select_model_tier) — moved
+# off Groq's llama-3.1-8b-instant onto Google's Gemma via the Generative
+# Language API, sharing GEMINI_API_KEYS above (the same canonical Google
+# client apps.image_info_extractor.gemini_client uses — see
+# apps.integrations.google_genai_client). The reasoning tier
+# (GROQ_MODEL_REASONING above) is completely unaffected by this: it still
+# runs on Groq, unchanged.
+GOOGLE_FAST_MODEL = os.environ.get("GOOGLE_FAST_MODEL", "gemma-4-31b-it")
+GOOGLE_FAST_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get("GOOGLE_FAST_FALLBACK_MODELS", "").split(",")
+    if m.strip()
+]
+
 # Runs the job worker as a thread inside the web process instead of as a
 # separate `manage.py runworker`. For free hosting tiers that have no
 # always-on background process (Render free, PythonAnywhere free) — without it,

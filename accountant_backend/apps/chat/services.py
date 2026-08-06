@@ -8,8 +8,10 @@ from apps.billing.models import Subscription
 from apps.billing.services import refund_feature_usage
 from apps.customers.models import Customer
 from apps.image_info_extractor import matching
+from apps.sales.business_date import BusinessDateError, business_today, resolve as resolve_business_date
 
 from . import prompt
+from .google_client import call_gemma_planner
 from .groq_client import call_groq, call_groq_text
 from .models import ChatMessage
 from .serializers import AiReplySerializer
@@ -396,7 +398,14 @@ def select_model_tier(message_text, language):
 
 
 def _call_model(tier, messages):
-    return call_groq(messages=messages, reasoning=(tier == "reasoning"))
+    """The single dispatch point between the two chat-turn tiers. "fast" now
+    means Gemma via Google (`apps.chat.google_client`), not Groq's 8B —
+    `select_model_tier`'s routing rule itself is unchanged, only what "fast"
+    resolves to. "reasoning" is untouched: still Groq's 70B, same call as
+    before this swap."""
+    if tier == "fast":
+        return call_gemma_planner(messages=messages)
+    return call_groq(messages=messages, reasoning=True)
 
 
 #: Languages whose final reply text/speech_text are COMPOSED FRESH by the
@@ -568,6 +577,20 @@ def generate_reply(*, business, conversation, text, language=None):
     # language (or a failed call, whose reply_data is already the fixed,
     # correctly-localized FALLBACK_REPLIES text) it IS the final reply.
     ChatMessage.objects.create(conversation=conversation, sender="owner", text=text)
+    # A "report" has no single recipient — it can span every customer in the
+    # business — so it can never be sent via the confirm/send pipeline
+    # (/documents/send/ requires a resolvable phone number and 400s with
+    # RECIPIENT_REQUIRED for report drafts with no customer_id). Converted
+    # here, at creation time, into the same report_view shape
+    # _attach_report_view produces, so it renders as a View button instead
+    # of a Confirm & Send card regardless of what the owner's own wording
+    # matched against.
+    draft_document = reply_data.get("draft_document")
+    report_view_from_draft = None
+    if isinstance(draft_document, dict) and draft_document.get("doc_type") == "report":
+        report_view_from_draft = _report_view_from_draft_document(draft_document)
+        draft_document = None
+
     ai_message = ChatMessage.objects.create(
         conversation=conversation,
         sender="ai",
@@ -576,7 +599,8 @@ def generate_reply(*, business, conversation, text, language=None):
         draft_bill=reply_data.get("draft_bill"),
         document_ready=reply_data.get("document_ready"),
         draft_action=reply_data.get("draft_action"),
-        draft_document=reply_data.get("draft_document"),
+        draft_document=draft_document,
+        report_view=report_view_from_draft,
         # These two were missing entirely until now: draft_customer/draft_payment
         # were validated by AiReplySerializer and even linked to a real customer
         # above, but never actually written to the ChatMessage row — so the
@@ -643,6 +667,34 @@ def generate_reply(*, business, conversation, text, language=None):
         _attach_report_view(business, ai_message, text)
 
     return ai_message
+
+
+def _report_view_from_draft_document(draft_document):
+    """Builds the same report_view shape `_attach_report_view` produces, but
+    from the model's own structured `draft_document` (doc_type "report")
+    rather than re-deriving it from the owner's raw text. Used at message
+    creation so a report the model proposed always gets a View button
+    rather than depending on the independent text-regex heuristic also
+    matching the same message.
+    """
+    try:
+        # None means "use today", same as resolve()'s own contract — matches
+        # how ConfirmDraftDocumentView already treats a missing date_from/to.
+        date_from = resolve_business_date(draft_document.get("date_from")) or business_today()
+        date_to = resolve_business_date(draft_document.get("date_to")) or business_today()
+    except BusinessDateError:
+        return None
+
+    summary = (
+        f"Details for {date_from.isoformat()}"
+        if date_from == date_to
+        else f"Details from {date_from.isoformat()} to {date_to.isoformat()}"
+    )
+    return {
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "summary": summary,
+    }
 
 
 def _attach_report_view(business, ai_message, owner_text):

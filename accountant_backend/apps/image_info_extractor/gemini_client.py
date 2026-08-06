@@ -2,12 +2,11 @@ import json
 import logging
 
 from django.conf import settings
-from google import genai
 from google.genai import types
 
-logger = logging.getLogger(__name__)
+from apps.integrations.google_genai_client import generate as _google_generate, model_ladder
 
-_clients = {}
+logger = logging.getLogger(__name__)
 
 # The "amount" rules below are load-bearing, not decoration. Asking for a bare
 # "amount" made the model return the bill's *grand total* — which on a
@@ -65,53 +64,23 @@ Return ONLY the JSON object, no other text.
 """.strip()
 
 
-def _client_for(key):
-    if key not in _clients:
-        _clients[key] = genai.Client(api_key=key)
-    return _clients[key]
-
-
-def _models(primary, fallbacks):
-    """The model to try first, then the fallbacks, de-duplicated.
-
-    Rotating *keys* is the wrong remedy for the most common real failure:
-    `503 UNAVAILABLE - "This model is currently experiencing high demand"` is
-    the model being busy, not the key being out of quota, so every key fails
-    identically and the owner just sees "Sorry, I couldn't process that".
-    Falling back to a different model is what actually recovers.
-    """
-    seen, ordered = set(), []
-    for name in [primary, *fallbacks]:
-        if name and name not in seen:
-            seen.add(name)
-            ordered.append(name)
-    return ordered
-
-
 def _generate(contents, *, config=None, models=None):
     """Runs `contents` through the model/key ladder, returning the raw response.
 
-    Ordered model-first: a busy model is retried on a different model before
-    burning through the other keys, since a 503 has nothing to do with the key.
+    Key rotation and model-fallback mechanics live in
+    apps.integrations.google_genai_client (the one canonical Google API
+    client this codebase uses — apps.chat.google_client's fast-tier chat
+    planner shares this same underlying implementation). This function
+    keeps only what's specific to vision extraction: which keys/models to
+    use and the vision-ladder default.
     """
-    keys = settings.GEMINI_API_KEYS
-    if not keys:
-        raise RuntimeError("No GEMINI_API_KEY configured on this server yet.")
-
-    last_error = None
-    for model in models or _models(settings.GEMINI_MODEL, settings.GEMINI_FALLBACK_MODELS):
-        for idx, key in enumerate(keys):
-            try:
-                response = _client_for(key).models.generate_content(
-                    model=model, contents=contents, config=config
-                )
-                logger.info("gemini call ok key_index=%s model=%s", idx, model)
-                return response
-            except Exception as exc:  # noqa: BLE001 - any failure tries the next key/model
-                last_error = exc
-                logger.warning("gemini call failed key_index=%s model=%s error=%s", idx, model, exc)
-
-    raise last_error
+    return _google_generate(
+        settings.GEMINI_API_KEYS,
+        models or model_ladder(settings.GEMINI_MODEL, settings.GEMINI_FALLBACK_MODELS),
+        contents,
+        config=config,
+        logger=logger,
+    )
 
 
 def extract_receipt_data(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
@@ -146,6 +115,6 @@ def generate_text(instructions: str, text: str) -> str:
     """
     response = _generate(
         [instructions + "\n\n" + text],
-        models=_models(settings.GEMINI_TEXT_MODEL, settings.GEMINI_TEXT_FALLBACK_MODELS),
+        models=model_ladder(settings.GEMINI_TEXT_MODEL, settings.GEMINI_TEXT_FALLBACK_MODELS),
     )
     return (response.text or "").strip()

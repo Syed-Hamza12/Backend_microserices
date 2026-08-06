@@ -791,6 +791,23 @@ class ConfirmDraftDocumentView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # A report has no single recipient (it can span every customer in the
+        # business), so it can never be resolved by /documents/send/'s
+        # phone-number requirement — see apps.chat.services, which now
+        # converts report drafts to report_view at creation time instead.
+        # Guarded here too in case an older stored message still carries one.
+        if message.draft_document.get("doc_type") == "report":
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_SENDABLE",
+                        "message": "A report has no single recipient and cannot be sent — view it instead.",
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # Same single-claim guard as the other confirms: a double tap must not
         # queue two identical documents to the customer.
         claimed = ChatMessage.objects.filter(pk=message.pk, draft_confirmed=False).update(draft_confirmed=True)

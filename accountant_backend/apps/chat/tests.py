@@ -14,6 +14,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
+from django.conf import settings
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APITestCase
@@ -22,7 +23,7 @@ from apps.accounts.models import Business, User
 from apps.customers.models import Customer
 from apps.sales.models import ActivityEntry, SaleLineItem
 
-from . import domain_knowledge, services
+from . import domain_knowledge, google_client, services
 from .models import ChatMessage, Conversation
 from .prompt import (
     UNTRUSTED_CLOSE,
@@ -254,10 +255,13 @@ class GenerateReplyPersistsEveryDraftFieldTests(TestCase):
         return json.dumps(base)
 
     def test_draft_customer_is_persisted(self):
+        # "add customer Bilal" matches none of the bill/edit/document hint
+        # patterns -> fast tier -> Gemma (apps.chat.google_client), not
+        # Groq. See services._call_model.
         payload = self._payload(draft_customer={
             "name": "Bilal", "phone": None, "opening_balance": 0, "summary": "Add Bilal",
         })
-        with mock.patch("apps.chat.services.call_groq", return_value=payload):
+        with mock.patch("apps.chat.services.call_gemma_planner", return_value=payload):
             reply = services.generate_reply(
                 business=self.business, conversation=self.conversation, text="add customer Bilal",
             )
@@ -265,11 +269,13 @@ class GenerateReplyPersistsEveryDraftFieldTests(TestCase):
         self.assertEqual(reply.draft_customer["name"], "Bilal")
 
     def test_draft_payment_is_persisted(self):
+        # Same fast-tier/Gemma routing as above — this message matches no
+        # bill/edit/document hint pattern either.
         payload = self._payload(draft_payment={
             "customer_id": None, "customer_name_guess": "Ali", "full_balance": True,
             "amount": None, "method": None, "summary": "Clear Ali's balance",
         })
-        with mock.patch("apps.chat.services.call_groq", return_value=payload):
+        with mock.patch("apps.chat.services.call_gemma_planner", return_value=payload):
             reply = services.generate_reply(
                 business=self.business, conversation=self.conversation,
                 text="Ali ne apni puri payment kar di, uska balance khtm kar do",
@@ -545,7 +551,14 @@ class FallbackReplyLocalizationTests(TestCase):
         return business, Conversation.objects.create(business=business)
 
     def _force_failure(self, business, conversation, language):
-        with mock.patch("apps.chat.services.call_groq", side_effect=Exception("boom")):
+        # "hello" matches no bill/edit/document hint pattern for any
+        # language, so this is always fast-tier -> Gemma
+        # (apps.chat.google_client), regardless of `language`. Forcing the
+        # JSON step to fail here is enough to produce ai_failed=True — the
+        # roman_ur/ur response-writer step is skipped entirely on that path
+        # (see generate_reply's `not ai_failed` guard), so it never reaches
+        # call_groq at all in this forced-failure scenario.
+        with mock.patch("apps.chat.services.call_gemma_planner", side_effect=Exception("boom")):
             return services.generate_reply(
                 business=business, conversation=conversation, text="hello", language=language
             )
@@ -636,12 +649,15 @@ class ModelRoutingTests(TestCase):
 
 
 class ModelTierSelectionTests(TestCase):
-    """select_model_tier is the two-way (8B/70B) Groq dispatch. Gemini is not
-    used for chat replies at all anymore — its free-tier quota (20
-    requests/day) can't carry ordinary chat volume; it is reserved for
-    apps.image_info_extractor.gemini_client.extract_receipt_data (OCR) only.
-    See ModelFallbackTests for what happens when Groq's Roman Urdu output
-    needs a retry — it stays on Groq, it does not fall back to Gemini."""
+    """select_model_tier is the two-way fast/reasoning dispatch — purely
+    intent-based, language-independent (see its own docstring). "fast" is
+    Gemma via Google's Generative Language API (apps.chat.google_client);
+    "reasoning" is Groq's llama-3.3-70b-versatile, unchanged. Neither tier
+    is apps.image_info_extractor.gemini_client (OCR vision extraction /
+    transliteration) — that is a separate, unrelated Google-hosted path;
+    see test_generate_reply_never_touches_gemini. See ModelFallbackTests
+    for what happens when Groq's Roman Urdu response-writer output needs a
+    retry — it stays on Groq, it does not fall back to anything else."""
 
     def test_roman_urdu_routes_to_reasoning_by_default(self):
         self.assertEqual(services.select_model_tier("hello", "roman_ur"), "reasoning")
@@ -655,16 +671,92 @@ class ModelTierSelectionTests(TestCase):
         self.assertEqual(services.select_model_tier("make a bill for Ali", "en"), "reasoning")
 
     def test_generate_reply_never_touches_gemini(self):
+        """"salam" (roman_ur, no bill/edit/document intent) is fast-tier and
+        also gets the roman_ur response-writer pass: one call to Gemma (the
+        JSON/planner step, apps.chat.google_client) and one to Groq's 70B
+        (the response-writer step, apps.chat.groq_client) — but NEVER
+        apps.image_info_extractor.gemini_client (OCR vision extraction /
+        transliteration), a completely separate, unrelated Google-hosted
+        path this test guards against ordinary chat ever reaching."""
         user = User.objects.create_user(username="g@x.com", email="g@x.com", password="pw")
         business = Business.objects.create(owner=user, business_name="Test Shop", language="roman_ur")
         conversation = Conversation.objects.create(business=business)
-        payload = json.dumps({
+        json_payload = json.dumps({
             "text": "Hello ji", "speech_text": None, "draft_bill": None,
             "document_ready": None, "draft_action": None, "draft_document": None,
         })
-        with mock.patch("apps.chat.services.call_groq", return_value=payload) as mock_groq:
+        writer_payload = json.dumps({"text": "Salam! Kaise madad karoon?", "speech_text": None})
+        with mock.patch(
+                "apps.chat.services.call_gemma_planner", return_value=json_payload
+        ) as mock_gemma, mock.patch(
+                "apps.chat.services.call_groq", return_value=writer_payload
+        ) as mock_groq, mock.patch(
+                "apps.image_info_extractor.gemini_client.generate_text"
+        ) as mock_gemini_text, mock.patch(
+                "apps.image_info_extractor.gemini_client.extract_receipt_data"
+        ) as mock_gemini_vision:
             services.generate_reply(business=business, conversation=conversation, text="salam")
+        mock_gemma.assert_called_once()
         mock_groq.assert_called_once()
+        mock_gemini_text.assert_not_called()
+        mock_gemini_vision.assert_not_called()
+
+
+class GoogleClientTests(TestCase):
+    """apps.chat.google_client — the fast/planner-tier Gemma client. Its own
+    logic is just the OpenAI-messages -> google.genai `contents`/
+    `system_instruction` translation and picking the right settings; the
+    actual key-rotation mechanics are apps.integrations.google_genai_client,
+    already covered by apps/integrations/tests.py."""
+
+    def test_splits_system_message_out_and_maps_assistant_to_model_role(self):
+        messages = [
+            {"role": "system", "content": "You are the AI accountant."},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": '{"text": "hi"}'},
+            {"role": "user", "content": "bye"},
+        ]
+        system_instruction, contents = google_client._to_google_contents(messages)
+        self.assertEqual(system_instruction, "You are the AI accountant.")
+        self.assertEqual([c.role for c in contents], ["user", "model", "user"])
+        self.assertEqual(contents[1].parts[0].text, '{"text": "hi"}')
+
+    def test_call_gemma_planner_uses_gemini_keys_and_configured_fast_model(self):
+        messages = [
+            {"role": "system", "content": "system text"},
+            {"role": "user", "content": "hello"},
+        ]
+        fake_response = mock.Mock(text='{"text": "ok"}')
+        with mock.patch("apps.chat.google_client.generate", return_value=fake_response) as mock_generate:
+            result = google_client.call_gemma_planner(messages=messages)
+
+        self.assertEqual(result, '{"text": "ok"}')
+        call_kwargs = mock_generate.call_args
+        keys_arg, models_arg, contents_arg = call_kwargs.args[0], call_kwargs.args[1], call_kwargs.args[2]
+        self.assertEqual(keys_arg, settings.GEMINI_API_KEYS)
+        self.assertEqual(models_arg[0], settings.GOOGLE_FAST_MODEL)
+        self.assertEqual(len(contents_arg), 1)  # only the non-system message
+        config = call_kwargs.kwargs["config"]
+        self.assertEqual(config.response_mime_type, "application/json")
+        self.assertEqual(config.system_instruction, "system text")
+
+    def test_reasoning_tier_is_never_routed_through_gemma(self):
+        """_call_model's dispatch: 'reasoning' must always reach Groq, never
+        the Gemma client, regardless of what Gemma is even configured to."""
+        with mock.patch("apps.chat.services.call_gemma_planner") as mock_gemma, \
+                mock.patch("apps.chat.services.call_groq", return_value="raw") as mock_groq:
+            result = services._call_model("reasoning", [{"role": "user", "content": "x"}])
+        mock_gemma.assert_not_called()
+        mock_groq.assert_called_once_with(messages=[{"role": "user", "content": "x"}], reasoning=True)
+        self.assertEqual(result, "raw")
+
+    def test_fast_tier_is_never_routed_through_groq(self):
+        with mock.patch("apps.chat.services.call_gemma_planner", return_value="raw") as mock_gemma, \
+                mock.patch("apps.chat.services.call_groq") as mock_groq:
+            result = services._call_model("fast", [{"role": "user", "content": "x"}])
+        mock_groq.assert_not_called()
+        mock_gemma.assert_called_once_with(messages=[{"role": "user", "content": "x"}])
+        self.assertEqual(result, "raw")
 
 
 class ModelFallbackTests(TestCase):
@@ -738,8 +830,10 @@ class WhatsAppNotConnectedNoticeTests(TestCase):
         self.assertEqual(reply.text.count("WhatsApp"), 1)
 
     def test_no_notice_for_unrelated_messages(self):
+        # "thanks" matches no bill/edit/document hint pattern -> fast tier
+        # -> Gemma (apps.chat.google_client), not Groq.
         plain = self._payload("Sure, noted.")
-        with mock.patch("apps.chat.services.call_groq", return_value=plain):
+        with mock.patch("apps.chat.services.call_gemma_planner", return_value=plain):
             reply = services.generate_reply(
                 business=self.business, conversation=self.conversation, text="thanks",
             )

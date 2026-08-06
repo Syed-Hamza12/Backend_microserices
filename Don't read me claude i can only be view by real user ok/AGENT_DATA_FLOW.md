@@ -1,0 +1,393 @@
+# Agent System — Component & Data-Flow Reference
+
+Companion to `AGENTS.md` (read that first for the narrative explanation).
+This file is a debugging/extension reference: exact request/response shapes
+at every hop, which file to open for which symptom, and the step-by-step
+recipe for wiring in a new tool.
+
+## 1. Component map
+
+```
+apps/chat/                          apps/agent/
+┌─────────────────┐                ┌──────────────────┐
+│ views.py         │  HTTP in       │ capabilities.py   │  tool registry
+│ services.py      │  orchestrates  │ planner.py         │  decides WHAT
+│ prompt.py        │  builds prompt │ executor.py        │  decides HOW
+│ groq_client.py   │  calls Groq    │ goals.py           │  state machine
+│ serializers.py   │  validates out │ models.py (AgentGoal)│ persistence
+│ models.py         │  ChatMessage  │ results.py          │ Outcome/Clarification
+└─────────────────┘                │ recovery.py         │ opt-in retry
+                                    └──────────────────┘
+```
+
+Everything below is one continuous call chain across these two apps.
+
+## 2. Full call chain, with exact function signatures
+
+```
+1. HTTP request  → apps/chat/views.py
+        │  (calls) generate_reply(business, conversation, text, language)
+        ▼
+2. apps/chat/services.py :: generate_reply()
+        │
+        ├─▶ _recent_history(conversation, limit)         [reads ChatMessage rows]
+        ├─▶ prompt.build_messages(business, history, text, language)
+        │        │
+        │        ├─▶ build_system_prompt(business, language)
+        │        │        ├─▶ OUTPUT_CONTRACT_INSTRUCTIONS   (static string, the "tool schema")
+        │        │        ├─▶ build_business_context(business)   [SQL: customers, balances]
+        │        │        └─▶ build_entry_context(business)      [SQL: recent entries]
+        │        └─▶ returns messages = [{"role": "system", ...}, {"role":"user"/"assistant",...}, ...]
+        │
+        ├─▶ select_model_tier(text, language)  -> "fast" | "reasoning"
+        │        (intent-complexity only — needs_reasoning(text). Language does
+        │         NOT force this anymore; see §8 for the full model-routing story)
+        │
+        ├─▶ _call_model(tier, messages)          ["JSON/INTENT STEP"]
+        │        └─▶ groq_client.call_groq(messages=messages, reasoning=bool)
+        │                 └─▶ Groq().chat.completions.create(model=..., messages=..., response_format={"type":"json_object"})
+        │                 returns: raw JSON string
+        │
+        ├─▶ _parse_and_validate(raw)   -> dict "reply_data"
+        │        shape: {
+        │          "text": str,        ← for ur/roman_ur this is a PLACEHOLDER,
+        │                                 discarded/overwritten below — never
+        │                                 shown to the owner (see step 5)
+        │          "speech_text": str | "",
+        │          "draft_bill": {...} | null,
+        │          "draft_action": {...} | null,   (has its own "summary": str)
+        │          "draft_document": {"doc_type": "invoice"|"receipt"|"statement"|"report",
+        │                              "customer_id"?: int, "customer_name"?: str,
+        │                              "date_from"?: str, "date_to"?: str, "format"?: str,
+        │                              "summary": str} | null,
+        │          "document_ready": {...} | null
+        │        }
+        │        (validated via apps/chat/serializers.py :: AiReplySerializer)
+        │
+        ├─▶ ChatMessage.objects.create(...)   [persists the owner msg + the AI msg;
+        │        text/speech_text here are provisional for ur/roman_ur]
+        │
+        ├─▶ apply_safe_document_send(business, conversation, ai_message, reply_data, language)
+        │        returns bool: True if it already wrote FINAL localized text
+        │        (a Python-template outcome string or a Clarification — see below)
+        │        │
+        │        ├─▶ apps/agent/planner.py :: plan_from_reply(business, conversation, ai_message, reply_data)
+        │        │        reads reply_data["draft_document"] ONLY — draft_bill/draft_action
+        │        │        never reach the agent app (see §5, "what's NOT wired in yet")
+        │        │        │
+        │        │        ├─▶ compose_plan(generator_capability, have)   [backward-chains]
+        │        │        │        loop: for each missing required_input, find_producer() in CAPABILITIES
+        │        │        │        returns step_names: list[str], e.g.
+        │        │        │        ["find_customer","find_latest_entry","choose_rendering_format",
+        │        │        │         "generate_document_from_entry","send_whatsapp_document"]
+        │        │        │
+        │        │        └─▶ for each step_name: CAPABILITIES[name].resolve(business, conversation, have)
+        │        │                 returns dict (merged into `have` for the next step) OR Clarification
+        │        │        returns: list[{"capability": str, "resolved": dict}]  OR  Clarification  OR  None
+        │        │
+        │        └─▶ apps/agent/executor.py :: execute_plan(business, conversation, message, steps)
+        │                 │
+        │                 ├─▶ GoalManager.start(...)              [creates AgentGoal row, status="executing"]
+        │                 │
+        │                 ├─▶ for each step: CAPABILITIES[name].execute(business, resolved)
+        │                 │        returns Outcome(success, output, text, pending_delivery_id, waiting_on)
+        │                 │        (outcome.text is a Python template string, e.g.
+        │                 │         apps/agent/capabilities.py's _SENDING_TEXT — NOT model output)
+        │                 │
+        │                 ├─▶ GoalManager.record_step(goal, index, outcome)   [updates AgentGoal.plan JSONField]
+        │                 │
+        │                 └─▶ GoalManager.advance(goal, status=...)
+        │                          status ∈ {"failed", "awaiting_verification", "done"}
+        │
+        └─▶ [ONLY if language in ("ur","roman_ur") AND NOT ai_failed AND
+             apply_safe_document_send returned False — i.e. nothing above
+             already wrote final localized text]     ["RESPONSE-WRITER STEP"]
+                 │
+                 ├─▶ _build_execution_summary(reply_data)  -> plain-text summary
+                 │        draft_action.summary, or draft_document.summary, or a
+                 │        built draft_bill description, or (no draft at all)
+                 │        reply_data["text"] used as raw CONTENT, not shown directly
+                 │
+                 └─▶ _write_final_reply(original_user_text, summary, language)
+                          └─▶ call_groq(reasoning=True) with a SHORT prompt:
+                                 owner's message + execution summary ONLY —
+                                 no system prompt, no business context, no history
+                              returns: (composed_text, composed_speech_text)
+                          ai_message.text/speech_text saved with this — THIS is
+                          what the owner actually sees for ur/roman_ur turns
+
+   ── if a step set outcome.waiting_on (e.g. send_whatsapp_document queued a job) ──
+
+3. apps/documents/delivery.py :: handle_document_send_job()   [background job, separate process/request]
+        │  on success or failure of the actual WhatsApp send:
+        └─▶ apps/agent/goals.py :: GoalManager.handle_event(event_type, payload)
+                 finds AgentGoal by delivery_id + status="awaiting_verification"
+                 sets goal.status = "done" | "failed"
+                 (the chat app's ChatMessage.pending_delivery lets the client poll
+                  DocumentDelivery status independently — see §4)
+```
+
+## 3. Data shapes at each boundary (for debugging)
+
+| Boundary | Shape | Where defined |
+|---|---|---|
+| LLM output (raw) | JSON string | Groq response, forced by `response_format_json=True` |
+| LLM output (parsed) | `reply_data: dict` | `apps/chat/serializers.py: AiReplySerializer` |
+| planner input | `reply_data["draft_document"]: dict` | `apps/agent/planner.py: plan_from_reply()` |
+| planner `have` dict | plain scalars + `_customer`/`_entry` object refs | built up across `resolve()` calls |
+| planner output | `list[{"capability": str, "resolved": dict}]` | `apps/agent/planner.py` |
+| executor→capability | `capability.execute(business, resolved: dict)` | `apps/agent/capabilities.py` |
+| capability output | `Outcome(success, output, text, pending_delivery_id, waiting_on)` | `apps/agent/results.py` |
+| persisted goal state | `AgentGoal.plan: list[{"capability","status","output"}]` | `apps/agent/models.py` (JSONField) |
+| execution summary (ur/roman_ur only) | plain string, e.g. `"Prepared a statement for Ali, 1 Jul to 31 Jul."` | `apps/chat/services.py: _build_execution_summary()` |
+| response-writer input | `f"OWNER'S MESSAGE:\n{text}\n\nEXECUTION SUMMARY:\n{summary}"` | `apps/chat/services.py: _write_final_reply()` |
+| response-writer output | `(text: str, speech_text: str \| None)` | same |
+| what the client sees | `ChatMessage.text` (agent-layer canned text, OR response-writer output, OR the JSON step's own text for English) + `ChatMessage.pending_delivery` (FK, polled) | `apps/chat/models.py` |
+
+**Key thing to know for debugging**: `have`/`resolved` dicts carry both
+JSON-safe scalars (`customer_id`, `amount`) AND live Django model instances
+under underscore-prefixed keys (`_customer`, `_entry`) so later steps don't
+need to re-query the DB. `GoalManager._json_safe()`
+(`apps/agent/goals.py:10-25`) strips every `_`-prefixed key before writing to
+the DB — so if you add a new capability that stashes something under a
+non-underscore key that isn't JSON-serializable, `goal.save()` will throw.
+Prefix any object reference with `_`.
+
+## 4. Where to look for a given symptom
+
+| Symptom | Look here |
+|---|---|
+| Model returns malformed/unexpected JSON | `apps/chat/prompt.py` — `OUTPUT_CONTRACT_INSTRUCTIONS`; check `_parse_and_validate` in `services.py` for what "bad shape" triggers a retry |
+| Model picks the wrong model tier (Urdu garbled, or slow) | `apps/chat/services.py: select_model_tier()` |
+| Agent never triggers for a document request | `apps/agent/planner.py: _GENERATOR_FOR_DOC_TYPE` — doc_type must be one of `invoice`/`receipt`/`statement`; `report` intentionally falls through untouched |
+| Agent says "I couldn't find/do X" when it should work | A capability's `resolve()` returned a `Clarification` — add logging in `apps/agent/capabilities.py` at the specific `_resolve_*` function |
+| A step ran but had no visible effect | Check `AgentGoal.plan` for that goal row in Django admin/shell — `AgentGoal.objects.filter(conversation=...).first().plan` |
+| WhatsApp send queued but never confirms | `apps/documents/delivery.py: handle_document_send_job` → `GoalManager.handle_event`; check `AgentGoal.status` stuck at `awaiting_verification` and `DocumentDelivery` status directly |
+| New capability crashes the whole chat turn | It shouldn't — `execute_plan()` wraps every `capability.execute()` call in `try/except Exception` (`apps/agent/executor.py:47-54`) and turns it into a failed `Outcome` instead of a 500. If chat is 500ing, the bug is upstream (planner/resolve, or capabilities.py import error) |
+| Planner throws `PlanningError` | A capability's `required_inputs`/`outputs` sets don't chain to the target — likely a typo in a set literal in `capabilities.py`, or a missing capability. `PlanningError` is caught in `plan_from_reply` and silently falls through to `None` (existing tap-confirm flow), so check logs, not user-facing errors |
+
+## 5. What's NOT wired into the agent app (deliberately)
+
+- `draft_bill` and `draft_action` never reach `apps/agent/`. They still go
+  through the older tap-confirm flow (`record_drafted_bill`,
+  `ConfirmDraftBillView`/`ConfirmDraftActionView` — search those names in
+  `apps/chat/services.py` and `apps/chat/views.py`). Only `draft_document`
+  for `invoice`/`receipt`/`statement` is auto-composed through the
+  planner/executor today. This was a deliberate scope limit (see
+  `capabilities.py`'s "Financial tier" comment) — don't assume
+  `record_payment` is reachable from a chat message yet; it exists in the
+  registry but nothing currently calls `compose_plan` targeting it from
+  `plan_from_reply`.
+- `report`-type documents (whole-business, no single customer) are not
+  auto-composed — `_GENERATOR_FOR_DOC_TYPE` in `planner.py` has no entry for
+  `"report"`, so those still go through the old flow untouched.
+
+## 6. Recipe: adding a new tool/capability end-to-end
+
+Concrete steps, in order, with the exact file each touches:
+
+1. **Write the real logic** as a normal Django service function, e.g. in
+   `apps/sales/services.py`. No agent-specific code here — just the feature.
+
+2. **Register it as a capability** in `apps/agent/capabilities.py`:
+   ```python
+   def _resolve_my_new_thing(business, conversation, have):
+       # read-only validation / lookups. Return a dict of new keys on success,
+       # or Clarification("a question for the owner") if something's missing/ambiguous.
+       ...
+
+   def _execute_my_new_thing(business, resolved):
+       # the actual side effect. Return Outcome(success=True, output={...}, text="...")
+       ...
+
+   CAPABILITIES["my_new_thing"] = Capability(
+       name="my_new_thing",
+       risk_tier="safe",  # or "financial" / "dangerous" — think about this
+       required_inputs={"customer_id"},   # what must already be in `have`
+       outputs={"my_output_key"},          # what this adds to `have` for later steps
+       side_effects=True,                  # False only for pure reads
+       synchronous=True,                   # False if it queues a background job (see send_whatsapp_document)
+       resolve=_resolve_my_new_thing,
+       execute=_execute_my_new_thing,
+   )
+   ```
+
+3. **Decide how it gets triggered**:
+   - If it should chain automatically off an existing `draft_document` type,
+     add/extend an entry in `apps/agent/planner.py: _GENERATOR_FOR_DOC_TYPE`.
+   - If it needs a wholly new LLM-expressible intent, you need step 4 below.
+   - If it's meant to be called directly (not LLM-triggered), you don't need
+     the planner at all — just call `CAPABILITIES["my_new_thing"].execute()`
+     from a view, same as any function call.
+
+4. **If it's a new intent the model must express**, extend the prompt
+   contract in `apps/chat/prompt.py` (`OUTPUT_CONTRACT_INSTRUCTIONS`) with
+   the new JSON field/shape, and extend
+   `apps/chat/serializers.py: AiReplySerializer` (and whichever
+   `DraftXSerializer` matches) to accept and validate it. Test by sending a
+   real message and checking `reply_data` in a debugger/log before it even
+   reaches the agent app — isolate "does the model emit the right JSON" from
+   "does the planner correctly consume it."
+
+5. **Test the planner/executor without hitting Groq**: since `resolve`/
+   `execute` are plain functions, you can unit-test
+   `compose_plan("my_new_thing", have)` and
+   `execute_plan(business=..., conversation=..., message=..., steps=[...])`
+   directly with a fake `have` dict and a real (test) database — no LLM call
+   needed. This is the fastest debug loop; use it before testing through chat.
+
+6. **If risk_tier is "financial" or "dangerous"**, do not wire it to
+   auto-execute from `plan_from_reply`/`apply_safe_document_send` the way
+   `send_whatsapp_document` does. Route it through a tap-confirm pattern
+   instead (owner must explicitly confirm before `execute()` runs) — follow
+   the existing `ConfirmDraftBillView`/`ConfirmDraftActionView` pattern in
+   `apps/chat/views.py` rather than the auto-composed path. This is exactly
+   why `record_payment` (financial tier) sits in the registry unused by the
+   planner today — treat that as the template to copy, not an oversight to
+   "fix" by wiring it in casually.
+
+## 8. Model consumption map — exactly which Groq model runs, per call site
+
+Two models, both configured in `accountant_backend/settings.py:200-201`
+(env vars `GROQ_MODEL_FAST` / `GROQ_MODEL_REASONING`, defaults shown):
+
+```
+GROQ_MODEL_FAST      = llama-3.1-8b-instant       ("fast" tier — cheap, quick)
+GROQ_MODEL_REASONING = llama-3.3-70b-versatile     ("reasoning" tier — slower, pricier)
+```
+
+Both models are reached through exactly **one** chokepoint —
+`apps/chat/groq_client.py: call_groq(messages, reasoning: bool)` — so every
+consumption question reduces to "what sets `reasoning=True` vs `False`
+before this call."
+
+**A chat turn is now up to two separate Groq calls with two separate jobs**
+(this is the model-routing refactor — see AGENTS.md §6.5 for the full
+narrative):
+
+1. **JSON/intent step** — understands the message, produces
+   draft_bill/draft_action/draft_document per the full output contract, plus
+   a `"text"` field. Tier picked by `select_model_tier()`, purely on intent
+   complexity. **For `ur`/`roman_ur`, this `"text"` is a throwaway
+   placeholder — it is never shown to the owner.**
+2. **Response-writer step** — `ur`/`roman_ur` only, and ONLY when nothing
+   else already produced final localized text (see the skip conditions
+   below). Composes a **brand-new** reply from the owner's original message
+   plus a plain execution summary — it is **not** given the JSON step's
+   `"text"` and is not asked to rewrite anything. Always 70B.
+
+| Call site | File : line | Model used | Condition |
+|---|---|---|---|
+| JSON/intent step (all languages) | `services.py: generate_reply()` → `_call_model(tier, ...)` | 8B **or** 70B | `tier = select_model_tier(text, language)` — **language no longer forces this**, only `needs_reasoning(text)` does |
+| Response-writer step | `services.py: _write_final_reply()` (~line 370) | **70B always**, only when `language in ("ur","roman_ur")` AND `apply_safe_document_send()` did NOT already write final text | Short prompt = owner's message + `_build_execution_summary()`'s output — never the JSON step's own `"text"`, never the full context |
+| Roman-Urdu-in transliteration | `services.py: transliterate_to_roman_urdu()` (~line 75) → `call_groq_text()` | **70B always** | `call_groq_text()` hardcodes `reasoning=True` (`groq_client.py:88-92`) — no fast path exists |
+| Receipt/photo OCR | `apps/image_info_extractor/gemini_client.py` | **Gemini** (not Groq at all) | always — separate provider, separate quota, unrelated to fast/reasoning choice |
+
+`select_model_tier()` rule (`apps/chat/services.py:291-313`) — now the same
+rule for every language:
+
+```python
+def select_model_tier(message_text, language):
+    return "reasoning" if prompt.needs_reasoning(message_text) else "fast"
+```
+
+Language-based routing didn't disappear — it moved to the response-writer
+step, which runs **only** for `ur`/`roman_ur`, **only** when nothing already
+wrote final text, and **composes fresh** rather than rewriting the JSON step:
+
+```python
+_WRITER_LANGUAGES = ("ur", "roman_ur")
+agent_overwrote_text = apply_safe_document_send(...)  # True = already final, localized
+if language in _WRITER_LANGUAGES and not ai_failed and not agent_overwrote_text:
+    summary = _build_execution_summary(reply_data)     # NOT reply_data["text"]
+    final_text, final_speech = _write_final_reply(text, summary, language)
+```
+
+**Three ways a `ur`/`roman_ur` turn can end, each with a different call
+count** — this is the part worth understanding for cost tuning:
+
+| Scenario | JSON-step model | Response-writer call? | Why |
+|---|---|---|---|
+| Plain question/small talk, no draft | **8B** | **Yes, 70B, tiny prompt** | No structured summary to draw from besides re-expressing the JSON step's raw `"text"` as content — still composed fresh, not rewritten |
+| draft_bill / draft_action / unsupported draft_document (e.g. "report") | 8B or 70B (by `needs_reasoning`) | **Yes, 70B, tiny prompt** | `apply_safe_document_send()` returns `False` (`plan is None`) — nothing else wrote final text |
+| draft_document the agent layer fully auto-executes (invoice/receipt/statement `send`) | 8B or 70B (by `needs_reasoning`) | **No — skipped entirely** | `apply_safe_document_send()` already wrote final, localized text via a **Python template string** (`apps/agent/capabilities.py`'s `_SENDING_TEXT`) or a `Clarification` message — not a model call at all |
+
+**Worst case for call count**: a dictated Roman-Urdu voice message with
+billing intent, no agent auto-execution → transliterate-in (70B) + JSON step
+(70B) + response-writer (70B) = **3 calls touching the 70B model** — same
+count as before this refactor, but the response-writer's prompt is two short
+paragraphs (owner's message + one-line summary), not the full system prompt.
+**Best case for `ur`/`roman_ur`**: a "send Ali his invoice" that the agent
+layer fully auto-executes → **1 call total** (JSON step only, response-writer
+skipped) — this case did not exist before; previously every `ur`/`roman_ur`
+turn cost at least one full-context 70B call no matter what.
+**Best case overall** (unchanged): a typed English question with no
+billing/document intent → **1 call to the 8B model, nothing else.**
+
+**Where to intervene if you need to cut consumption further:**
+- `prompt.needs_reasoning()` (in `apps/chat/prompt.py`) is the regex/intent
+  check deciding fast-vs-reasoning for the JSON step, for every language now
+  — tightening or loosening this directly shifts traffic between the two
+  models, language-independently.
+- The response-writer step is unconditionally 70B for `ur`/`roman_ur` by
+  design (this is the one place actual write-quality is enforced) — re-read
+  `select_model_tier()`'s docstring before changing this; it documents the
+  real production incident (garbled Urdu shown to an owner) this exists to
+  prevent.
+- `_build_execution_summary()`/`_write_final_reply()`'s prompt is already
+  minimal — owner's message + a one-line fact summary, never the full
+  context. Don't accidentally widen it by passing business context or chat
+  history "for better phrasing"; that reintroduces the cost this refactor
+  removed, and also reopens the door for 8B/70B's own prose to leak back
+  into the final reply.
+- If you ever add a new capability whose outcome should be spoken aloud
+  automatically (like `send_whatsapp_document`'s `_SENDING_TEXT`), write it
+  as a plain per-language Python string dict, the same pattern — that skips
+  the response-writer call entirely for that turn, which is strictly better
+  than composing it fresh every time.
+- `MAX_TRANSLITERATE_CHARS` (`services.py`) caps how much text goes into the
+  transliteration call — lowering it reduces tokens-per-call but doesn't
+  change which model runs.
+
+## 8.5. API key rotation reliability + 20-key support
+
+`_collect_keys()` (`accountant_backend/settings.py:177-193`) is the single
+config-driven key loader for both Groq and Gemini — reads `<VAR>`,
+`<VAR>_1` .. `<VAR>_{max_n}`, keeps whichever are actually set. Both
+`GROQ_API_KEYS` and `GEMINI_API_KEYS` now pass `max_n=20` (raised from 10) —
+that's the only line to touch if you ever need more.
+
+**Bug fixed**: `apps/chat/groq_client.py: _client_for()` now constructs each
+key's `Groq` client with `max_retries=0`. Without it, the SDK silently
+retries a failing key internally (with backoff) before our own rotation loop
+ever sees the failure — with N keys that could multiply one failed request
+into N × several attempts, long enough to blow through the request's own
+timeout and show the owner a raw error even though a later key was healthy.
+`max_retries=0` makes every key attempt fail once, fast, so `call_groq()`'s
+existing for-loop (`groq_client.py:56-67`, unchanged) is the sole retry
+authority and reliably reaches every configured key inside one request.
+**The rotation loop's logic itself was already correct** — this was purely a
+latency/timeout bug, not a broken loop, exception swallow, or exit condition
+bug. The user-facing contract now holds: an error only reaches the owner if
+every configured key has failed.
+
+Gemini's rotation (`apps/image_info_extractor/gemini_client.py: _generate()`)
+was not touched beyond the key-count bump — it wasn't the reported bug, and
+"maintain identical behavior" applied there. If Gemini calls ever show the
+same "recovers on the next message" symptom, apply the same fix: check
+whether `genai.Client()` needs an equivalent no-internal-retry option before
+assuming the loop logic is at fault.
+
+## 9. Quick reference — files by responsibility
+
+| File | Responsibility | Safe to edit freely? |
+|---|---|---|
+| `apps/chat/prompt.py` | System prompt / JSON contract the LLM must follow | Edit carefully, test with real Groq calls after |
+| `apps/chat/groq_client.py` | Raw Groq API wrapper, key rotation, `max_retries=0` reliability fix | Rarely needs touching — if you do, keep `max_retries=0` in `_client_for()` |
+| `apps/chat/services.py` | Orchestrates one chat turn end-to-end | Central — read before editing anything else |
+| `apps/chat/serializers.py` | Validates the LLM's JSON shape | Edit when adding a new JSON field to the contract |
+| `apps/agent/capabilities.py` | The tool registry — safety boundary | Additive edits (new capabilities) are low-risk; editing existing ones needs care |
+| `apps/agent/planner.py` | Backward-chaining composition | Edit `_GENERATOR_FOR_DOC_TYPE` freely; touch `compose_plan` itself rarely |
+| `apps/agent/executor.py` | Runs steps in order | Rarely needs touching |
+| `apps/agent/goals.py` | Sole writer of `AgentGoal` | Don't write to `AgentGoal` from anywhere else |
+| `apps/agent/models.py` | `AgentGoal` schema | Migration required if changed |

@@ -246,20 +246,26 @@ Concrete steps, in order, with the exact file each touches:
    planner today — treat that as the template to copy, not an oversight to
    "fix" by wiring it in casually.
 
-## 8. Model consumption map — exactly which Groq model runs, per call site
+## 8. Model consumption map — exactly which model runs, per call site
 
-Two models, both configured in `accountant_backend/settings.py:200-201`
-(env vars `GROQ_MODEL_FAST` / `GROQ_MODEL_REASONING`, defaults shown):
+**Updated**: the fast tier moved off Groq onto Google's Gemma. Two models now, two providers:
 
 ```
-GROQ_MODEL_FAST      = llama-3.1-8b-instant       ("fast" tier — cheap, quick)
-GROQ_MODEL_REASONING = llama-3.3-70b-versatile     ("reasoning" tier — slower, pricier)
+GOOGLE_FAST_MODEL    = gemma-4-31b-it              ("fast" tier — cheap, quick; Google)
+GROQ_MODEL_REASONING = llama-3.3-70b-versatile     ("reasoning" tier — slower, pricier; Groq)
 ```
 
-Both models are reached through exactly **one** chokepoint —
-`apps/chat/groq_client.py: call_groq(messages, reasoning: bool)` — so every
-consumption question reduces to "what sets `reasoning=True` vs `False`
-before this call."
+configured in `accountant_backend/settings.py` (`GOOGLE_FAST_MODEL` near `GEMINI_*`, `GROQ_MODEL_REASONING`
+at line ~203).
+
+The two tiers are reached through **two separate, isolated chokepoints** — deliberately not one,
+so a Google outage can't touch Groq calls or vice versa:
+- `apps/chat/google_client.py: call_gemma_planner(messages)` — fast tier only.
+- `apps/chat/groq_client.py: call_groq(messages, reasoning: bool)` — reasoning tier
+  (`reasoning=True`) and the ur/roman_ur response-writer step (also `reasoning=True`).
+
+`apps/chat/services.py: _call_model(tier, messages)` is the single dispatch point between them —
+every consumption question reduces to "which tier did `select_model_tier()` pick."
 
 **A chat turn is now up to two separate Groq calls with two separate jobs**
 (this is the model-routing refactor — see AGENTS.md §6.5 for the full
@@ -278,10 +284,11 @@ narrative):
 
 | Call site | File : line | Model used | Condition |
 |---|---|---|---|
-| JSON/intent step (all languages) | `services.py: generate_reply()` → `_call_model(tier, ...)` | 8B **or** 70B | `tier = select_model_tier(text, language)` — **language no longer forces this**, only `needs_reasoning(text)` does |
-| Response-writer step | `services.py: _write_final_reply()` (~line 370) | **70B always**, only when `language in ("ur","roman_ur")` AND `apply_safe_document_send()` did NOT already write final text | Short prompt = owner's message + `_build_execution_summary()`'s output — never the JSON step's own `"text"`, never the full context |
-| Roman-Urdu-in transliteration | `services.py: transliterate_to_roman_urdu()` (~line 75) → `call_groq_text()` | **70B always** | `call_groq_text()` hardcodes `reasoning=True` (`groq_client.py:88-92`) — no fast path exists |
-| Receipt/photo OCR | `apps/image_info_extractor/gemini_client.py` | **Gemini** (not Groq at all) | always — separate provider, separate quota, unrelated to fast/reasoning choice |
+| JSON/intent step (all languages) | `services.py: generate_reply()` → `_call_model(tier, ...)` | Gemma **or** 70B | `tier = select_model_tier(text, language)` — **language no longer forces this**, only `needs_reasoning(text)` does; `tier == "fast"` → `google_client.call_gemma_planner()`, `tier == "reasoning"` → `groq_client.call_groq(reasoning=True)` |
+| Response-writer step | `services.py: _write_final_reply()` (~line 370) | **70B always** (Groq), only when `language in ("ur","roman_ur")` AND `apply_safe_document_send()` did NOT already write final text | Short prompt = owner's message + `_build_execution_summary()`'s output — never the JSON step's own `"text"`, never the full context |
+| Roman-Urdu-in transliteration | `services.py: transliterate_to_roman_urdu()` (~line 75) → `call_groq_text()` | **70B always** (Groq) | `call_groq_text()` hardcodes `reasoning=True` (`groq_client.py:88-92`) — no fast path exists |
+| Receipt/photo OCR | `apps/image_info_extractor/gemini_client.py` | **Gemini** (a *different* Google model from the chat planner's Gemma, same provider/key pool) | always — separate prompt/schema, unrelated to fast/reasoning choice |
+| OCR clarification follow-up wording | `apps/image_info_extractor/clarification.py` → `call_groq(reasoning=...)` | 8B **or** 70B (Groq, unchanged) | its own narrow two-tier split, outside `select_model_tier()` — deliberately left untouched by the fast-tier swap |
 
 `select_model_tier()` rule (`apps/chat/services.py:291-313`) — now the same
 rule for every language:

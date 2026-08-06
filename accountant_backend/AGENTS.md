@@ -129,32 +129,44 @@ no in-memory session state.
   through `GoalManager`. This is what survives between the synchronous
   request and the later async WhatsApp delivery callback.
 
-## 6.5. Which model actually runs — `llama-3.1-8b-instant` vs `llama-3.3-70b-versatile`
+## 6.5. Which model actually runs — Gemma (fast tier) vs `llama-3.3-70b-versatile`
 
-Two Groq models are configured (`settings.py:199-201`, overridable via `.env`):
+**Updated**: the chat "fast" tier moved from Groq's `llama-3.1-8b-instant` to Google's Gemma
+(`settings.GOOGLE_FAST_MODEL`, default `gemma-4-31b-it`) via the Generative Language API. The
+reasoning tier is completely unchanged — still Groq's `llama-3.3-70b-versatile`.
 
-| Setting | Model | Nickname in code |
-|---|---|---|
-| `GROQ_MODEL_FAST` | `llama-3.1-8b-instant` | "fast" tier |
-| `GROQ_MODEL_REASONING` | `llama-3.3-70b-versatile` | "reasoning" tier |
+| Setting | Model | Nickname in code | Provider |
+|---|---|---|---|
+| `GOOGLE_FAST_MODEL` | `gemma-4-31b-it` (default) | "fast" tier | Google, via `apps/chat/google_client.py` |
+| `GROQ_MODEL_REASONING` | `llama-3.3-70b-versatile` | "reasoning" tier | Groq, via `apps/chat/groq_client.py` |
 
-`apps/chat/groq_client.py: call_groq(reasoning=bool)` is the only place that
-picks between them — `reasoning=True` → 70B, `reasoning=False` → 8B.
+`apps/chat/services.py: _call_model(tier, messages)` is the only dispatch point — `tier ==
+"fast"` → `google_client.call_gemma_planner()`, `tier == "reasoning"` → `groq_client.call_groq(reasoning=True)`.
+Both providers are deliberately isolated from each other (no shared client, no shared retry
+state) so a Google outage cannot affect Groq calls or vice versa. Key rotation for the Google
+side reuses `settings.GEMINI_API_KEYS` and the canonical client in
+`apps/integrations/google_genai_client.py` — the same rotation/model-fallback code
+`apps/image_info_extractor/gemini_client.py` (vision OCR) uses, not a second copy of it.
+
+`GROQ_MODEL_FAST`/`llama-3.1-8b-instant` still exists as a setting and is still used, but only by
+`apps/image_info_extractor/clarification.py`'s own separate two-tier split for OCR
+follow-up-question wording — an unrelated, narrower flow outside `select_model_tier()`'s routing,
+left untouched by this change.
 
 **As of the model-routing refactor described here, there are now TWO
-separate Groq calls in a normal chat turn, each with its own job — not one
-call doing everything:**
+separate calls in a normal chat turn, each with its own job and potentially its own provider —
+not one call doing everything:**
 
 1. **The JSON/intent step** — understands the message, extracts entities,
    fills out the draft_bill/draft_action/draft_document JSON contract.
    Always decided by `select_model_tier()` (`apps/chat/services.py:300-322`)
    purely on **intent complexity**, via `prompt.needs_reasoning()` — never on
    language anymore:
-   - `llama-3.1-8b-instant` when the message doesn't look like a bill/edit/
+   - Gemma (`GOOGLE_FAST_MODEL`) when the message doesn't look like a bill/edit/
      document request (plain questions, small talk) — regardless of language.
    - `llama-3.3-70b-versatile` when `needs_reasoning()` detects billing/
      editing/document intent — regardless of language.
-2. **The response-writer step** — ONLY for `language in ("ur", "roman_ur")`,
+2. **The response-writer step** — ONLY for `language in ("ur", "roman_ur")`, still Groq 70B,
    `_write_final_reply()` (`apps/chat/services.py:370-430`) sends
    `llama-3.3-70b-versatile` the **owner's original message** plus a plain,
    Python-built **execution summary** of what was actually decided/done —
