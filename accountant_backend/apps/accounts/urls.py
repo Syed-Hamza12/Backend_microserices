@@ -13,6 +13,7 @@ urlpatterns = [
     # must persist BOTH tokens from this response, not just the access one.
     path("auth/token/refresh/", TokenRefreshView.as_view(), name="token-refresh"),
     path("business/profile/", views.BusinessProfileView.as_view(), name="business-profile"),
+    path("business/types/", views.BusinessTypeChoicesView.as_view(), name="business-type-choices"),
     path("business/logo/", views.BusinessLogoUploadView.as_view(), name="business-logo-upload"),
     # Serves the logo bytes. Django doesn't serve MEDIA_URL with DEBUG off, so
     # this is how a logo reaches the app in production without nginx.

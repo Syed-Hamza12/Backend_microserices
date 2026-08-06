@@ -213,6 +213,25 @@ class BusinessProfileView(APIView):
         return Response({"success": True, "data": serializer.data})
 
 
+class BusinessTypeChoicesView(APIView):
+    """The fixed list of business types the domain-knowledge layer
+    (apps.chat.domain_knowledge) has a matching code for — the single
+    source of truth the mobile app's search/select picker reads from at
+    signup and in Settings, instead of hardcoding its own copy that could
+    drift out of sync with what the backend actually recognises."""
+
+    def get(self, request):
+        return Response(
+            {
+                "success": True,
+                "data": [
+                    {"code": code, "label": label}
+                    for code, label in Business.BUSINESS_TYPE_CHOICES
+                ],
+            }
+        )
+
+
 class BusinessLogoUploadView(APIView):
     """Real logo upload (BACKEND_INTEGRATION_GUIDE.md's flagged gap — the
     mock UI's "Add Logo" toggle never actually uploaded anything). Mirrors

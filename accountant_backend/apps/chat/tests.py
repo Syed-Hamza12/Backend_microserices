@@ -7,7 +7,11 @@ OCR'd document text from being read as instructions.
 """
 
 import json
+import os
+import shutil
+import tempfile
 from decimal import Decimal
+from pathlib import Path
 from unittest import mock
 
 from django.test import TestCase
@@ -18,13 +22,15 @@ from apps.accounts.models import Business, User
 from apps.customers.models import Customer
 from apps.sales.models import ActivityEntry, SaleLineItem
 
-from . import services
+from . import domain_knowledge, services
 from .models import ChatMessage, Conversation
 from .prompt import (
     UNTRUSTED_CLOSE,
+    build_domain_knowledge_context,
     build_entry_context,
     build_item_price_context,
     build_messages,
+    build_special_instructions_context,
     build_system_prompt,
     needs_reasoning,
     wrap_untrusted,
@@ -945,6 +951,128 @@ class ItemPriceContextTests(TestCase):
     def test_no_context_outside_a_billing_message(self):
         self._sale(self.kashan, "20mm", Decimal("5"))
         self.assertEqual(build_item_price_context(self.business, "kashan ka balance kya hai"), "")
+
+
+class DomainKnowledgeTests(TestCase):
+    """apps.chat.domain_knowledge condenses a business-type markdown file
+    into the sections that actually steer model behavior, and
+    apps.chat.prompt wires it (plus the owner's own special_instructions)
+    into the system prompt in the required priority order: domain knowledge
+    first, then special instructions — always explicitly stated to win on
+    conflict."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="dk@x.com", email="dk@x.com", password="pw")
+        self.business = Business.objects.create(owner=self.user, business_name="Test Shop")
+        domain_knowledge._cache.clear()
+        self.tmp_dir = tempfile.mkdtemp()
+        self._patcher = mock.patch.object(domain_knowledge, "DOMAIN_DOCS_DIR", Path(self.tmp_dir))
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+        self.addCleanup(domain_knowledge._cache.clear)
+        self.addCleanup(shutil.rmtree, self.tmp_dir, True)
+
+    def _write_doc(self, business_type, content):
+        (Path(self.tmp_dir) / f"{business_type}.md").write_text(content, encoding="utf-8")
+
+    def test_condenses_only_the_steering_sections(self):
+        self._write_doc(
+            "HARDWARE",
+            "# Business Overview\nLong descriptive background not needed for steering.\n\n"
+            "# Common Units\nPiece, Foot, Kg, Dozen.\n\n"
+            "# Conversation Examples\nHundreds of lines of examples not meant for injection.\n\n"
+            "# Best Practices\nAlways confirm the size before drafting.\n",
+        )
+        context = domain_knowledge.get_domain_context("HARDWARE")
+        self.assertIn("Common Units", context)
+        self.assertIn("Piece, Foot, Kg, Dozen", context)
+        self.assertIn("Best Practices", context)
+        self.assertNotIn("Long descriptive background", context)
+        self.assertNotIn("Hundreds of lines", context)
+
+    def test_empty_for_unset_or_unknown_type(self):
+        self.assertEqual(domain_knowledge.get_domain_context(""), "")
+        self.assertEqual(domain_knowledge.get_domain_context("NO_SUCH_TYPE"), "")
+
+    def test_missing_domain_document_never_raises(self):
+        """A business_type with no matching file (unknown code, or a real
+        code — like most of the 47 in Business.BUSINESS_TYPE_CHOICES —
+        that simply has no .md yet) must degrade to "" silently. This is
+        the exact case for ~39 of the 47 configured business types today:
+        chat must keep working for those businesses, not error out."""
+        for business_type in ("MOBILE_SHOP", "TAILOR", "", "TOTALLY_UNKNOWN_CODE", None):
+            with self.subTest(business_type=business_type):
+                self.assertEqual(domain_knowledge.get_domain_context(business_type), "")
+
+    def test_file_is_read_and_parsed_only_once_across_repeated_requests(self):
+        """The whole point of the cache: 50 chat messages from the same
+        business in a row must not re-read and re-condense the markdown
+        file 50 times — only the first call (or a call after the file
+        actually changed) should touch disk for the real content."""
+        self._write_doc("HARDWARE", "# Best Practices\nAlways confirm size.\n")
+
+        real_read_text = Path.read_text
+        call_count = {"n": 0}
+
+        def counting_read_text(self_path, *args, **kwargs):
+            if self_path == Path(self.tmp_dir) / "HARDWARE.md":
+                call_count["n"] += 1
+            return real_read_text(self_path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", counting_read_text):
+            for _ in range(50):
+                context = domain_knowledge.get_domain_context("HARDWARE")
+                self.assertIn("Always confirm size", context)
+
+        self.assertEqual(
+            call_count["n"], 1,
+            "expected exactly one real file read across 50 identical requests",
+        )
+
+    def test_edited_file_is_picked_up_without_restart(self):
+        self._write_doc("HARDWARE", "# Best Practices\nVersion one.\n")
+        first = domain_knowledge.get_domain_context("HARDWARE")
+        self.assertIn("Version one", first)
+
+        # mtime resolution can be coarse on some filesystems; force it forward.
+        path = Path(self.tmp_dir) / "HARDWARE.md"
+        path.write_text("# Best Practices\nVersion two.\n", encoding="utf-8")
+        os.utime(path, (path.stat().st_mtime + 5, path.stat().st_mtime + 5))
+
+        second = domain_knowledge.get_domain_context("HARDWARE")
+        self.assertIn("Version two", second)
+        self.assertNotIn("Version one", second)
+
+    def test_build_system_prompt_includes_domain_and_instructions_in_priority_order(self):
+        self._write_doc("HARDWARE", "# Best Practices\nAlways confirm pipe size in mm.\n")
+        self.business.business_type = "HARDWARE"
+        self.business.special_instructions = "We call invoices Slip, never Bill."
+        self.business.save(update_fields=["business_type", "special_instructions"])
+
+        prompt_text = build_system_prompt(self.business, "hello")
+        domain_index = prompt_text.index("Always confirm pipe size in mm")
+        instructions_index = prompt_text.index("We call invoices Slip, never Bill")
+        self.assertLess(
+            domain_index, instructions_index,
+            "domain knowledge must appear before business-specific instructions",
+        )
+        self.assertIn("ALWAYS override the industry reference knowledge above", prompt_text)
+
+    def test_no_domain_or_instructions_sections_when_unset(self):
+        prompt_text = build_system_prompt(self.business, "hello")
+        self.assertEqual(build_domain_knowledge_context(self.business), "")
+        self.assertEqual(build_special_instructions_context(self.business), "")
+        self.assertNotIn("INDUSTRY REFERENCE KNOWLEDGE", prompt_text)
+        self.assertNotIn("BUSINESS-SPECIFIC RULES", prompt_text)
+
+    def test_special_instructions_are_not_wrapped_as_untrusted(self):
+        # These are the owner's own configured rules, meant to be followed —
+        # not third-party data whose instructions must be ignored.
+        self.business.special_instructions = "Never ask for phone number."
+        self.business.save(update_fields=["special_instructions"])
+        context = build_special_instructions_context(self.business)
+        self.assertNotIn(UNTRUSTED_CLOSE, context)
+        self.assertIn("Never ask for phone number.", context)
 
 
 class ConversationHistoryTests(APITestCase):

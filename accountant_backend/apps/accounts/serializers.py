@@ -51,6 +51,8 @@ class BusinessSerializer(serializers.ModelSerializer):
             "id",
             "business_name",
             "business_category",
+            "business_type",
+            "special_instructions",
             "currency_code",
             "logo_url",
             "has_logo",

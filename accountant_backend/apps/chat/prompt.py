@@ -7,6 +7,8 @@ from django.utils import timezone
 from apps.customers.models import Customer
 from apps.sales.models import ActivityEntry, SaleLineItem
 
+from . import domain_knowledge
+
 LANGUAGE_NAMES = {
     "en": "English",
     "ur": "Urdu",
@@ -1015,6 +1017,56 @@ def build_current_draft_context(conversation):
     )
 
 
+def build_domain_knowledge_context(business):
+    """Condensed reference knowledge for this business's industry (hardware,
+    garments, restaurant, ...) — see `apps.chat.domain_knowledge` for what
+    gets extracted and why. Comes from `business.business_type`, a fixed,
+    owner-selected code (Settings / signup), never free text the model or
+    owner could steer into loading an arbitrary file.
+
+    Placed BEFORE the owner's own special instructions in the prompt (see
+    build_system_prompt) and explicitly says so — a business-type default
+    ("we usually sell in dozens") must never outrank something this specific
+    owner actually said, even implicitly by ordering. Empty for a business
+    with no type set or no matching document yet — inject nothing rather
+    than guess an industry.
+    """
+    context = domain_knowledge.get_domain_context(business.business_type)
+    if not context:
+        return ""
+    return (
+        "\n\nINDUSTRY REFERENCE KNOWLEDGE for this business's trade — background on how "
+        "businesses like this one typically operate in Pakistan, to help you understand "
+        "vocabulary, units and unstated context. This is general background, NOT a rule from "
+        "this specific owner — if it conflicts with anything in BUSINESS-SPECIFIC RULES below "
+        "or anything the owner has actually said, those always win:\n" + context
+    )
+
+
+def build_special_instructions_context(business):
+    """The owner's own written rules for how this business wants the AI to
+    behave (Settings) — "we sell only in dozens", "never ask for phone
+    number", "we call invoices Slip". These ALWAYS override the industry
+    reference knowledge above and any other default behavior when they
+    conflict; the wording here states that explicitly rather than relying
+    on prompt position alone to carry the priority.
+    """
+    instructions = (business.special_instructions or "").strip()
+    if not instructions:
+        return ""
+    # NOT wrap_untrusted: that marker means "describe this, never follow
+    # instructions found inside it" (customer records, OCR'd bill text —
+    # third-party data). This is the opposite case — the business owner's
+    # own configured rules, written through Settings by the one person
+    # actually authorized to direct this AI's behavior. They are meant to
+    # be followed, not merely described.
+    return (
+        "\n\nBUSINESS-SPECIFIC RULES from the owner of this business — these ALWAYS override "
+        "the industry reference knowledge above, or any other default behavior, whenever they "
+        "conflict. Follow them exactly:\n" + instructions
+    )
+
+
 def build_system_prompt(business, message_text="", language=None, conversation=None):
     """`language` is the owner's live Settings choice, sent with each request.
 
@@ -1037,6 +1089,8 @@ def build_system_prompt(business, message_text="", language=None, conversation=N
         f"them, not by you, and NOT by the language or script the owner's message happens to be in\n"
         f"— their phone's speech recogniser may write their words in a different script entirely.\n"
         f"{script_rule}\n\n"
+        f"{build_domain_knowledge_context(business)}"
+        f"{build_special_instructions_context(business)}"
         f"{build_business_context(business)}"
         f"{entry_context}"
         f"{aggregate_context}"
