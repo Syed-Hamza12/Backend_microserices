@@ -1,10 +1,11 @@
 import re
 from datetime import date, timedelta
 
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.customers.models import Customer
-from apps.sales.models import ActivityEntry
+from apps.sales.models import ActivityEntry, SaleLineItem
 
 LANGUAGE_NAMES = {
     "en": "English",
@@ -54,10 +55,168 @@ DRAFT_BILL_HINT_PATTERN = re.compile(
     # Roman Urdu
     r"|\bbanao\b|\bbanana\b|\bbanaya\b|\bbana\b|\budhaar\b|\budhar\b|\bbecha\b|\bbechna\b"
     r"|\brakam\b|\bkharch\b|\bkitne\b|\bkitna\b|\bpaisay\b|\bpaise\b"
+    # "likhdo"/"likh do" ("write it down") is one of the most ordinary ways
+    # a shopkeeper says "make an entry" — missing it meant a message like
+    # "26,000 likhdo, Kashan ka 20mm" was routed as small talk, on the fast
+    # model, with none of the entry/item-history context a real bill needs.
+    r"|\blikh\w*\b"
     # Urdu script
     r"|بل|رسید|بنانا|بنائیں|بناؤ|بیچا|بیچنا|ادھار|رقم|قیمت|سودا",
     re.IGNORECASE,
 )
+
+# Filler words stripped before treating what's left of a bill message as
+# "item words" — otherwise every message shares words like "ka"/"ko"/"and"
+# and the overlap check below (deciding whether to widen the item search
+# past this customer) never says no. Deliberately generic — no item
+# vocabulary of any kind, since this business could be selling anything
+# (hardware sizes, cloth prints, grocery brands, whatever the owner's own
+# ledger already contains) and the words that matter are never known ahead
+# of time; only the words that never mean anything are.
+_ITEM_CONTEXT_STOPWORDS = {
+    "likh", "likhdo", "likho", "do", "kardo", "kar", "karo", "ka", "ki", "ke", "ko",
+    "wali", "wala", "wale", "aur", "and", "hai", "h", "de", "diya", "diye", "bill",
+    "banao", "banana", "record", "sale", "sold", "charge", "raha", "rahi", "hoon",
+}
+
+
+def _item_words(text):
+    """Word tokens for item matching, with one normalisation: a number and
+    an immediately-following short word get joined ("20 mm" -> "20mm")
+    before splitting. Without this, the owner typing "20 mm" (a space) never
+    overlaps with an item genuinely named "20mm" (no space) in the ledger —
+    a real bug this shipped with: it silently defeated the "does this
+    customer already have a matching item" check, so the search widened to
+    the rest of the business and leaked another customer's rate into a bill
+    that should have matched locally. Item names in this business's own
+    ledger are the ground truth for spacing; the owner's typed/spoken
+    message is not."""
+    text = re.sub(r"(\d+)\s+([a-zA-Z]+)\b", r"\1\2", (text or "").lower())
+    return {
+        w for w in re.findall(r"\w+", text)
+        if w not in _ITEM_CONTEXT_STOPWORDS and len(w) > 1
+    }
+
+
+def _distinct_recent_items(queryset, limit):
+    """The most recently sold distinct item names in `queryset`, each paired
+    with the rate it was LAST sold at — never an average or a list of every
+    historical rate, since the most recent one is what the owner actually
+    charges today."""
+    seen = {}
+    for line_item in queryset.order_by("-entry__timestamp")[:200]:
+        if line_item.item_name not in seen:
+            seen[line_item.item_name] = line_item.rate
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+def build_item_price_context(business, message_text):
+    """Real sale history for items the owner mentioned without a rate, or
+    with only a partial name — the exact case a small model cannot resolve
+    honestly on its own: "26,000 likhdo, Kashan ka 20mm" states a quantity
+    and an item but no price, and "5,000 likhdo black wali" names only a
+    color, expecting the model to already know the item means "20mm black"
+    from context. Guessing either is how a bill ends up with a fabricated
+    rate or the wrong variant on a real customer's ledger.
+
+    Resolved in the same priority a shopkeeper's own memory works: THIS
+    customer's own recent items first (they buy the same things repeatedly,
+    at the price this business actually charges them), then the rest of the
+    business (someone else may have bought the same item), and if neither
+    has anything close, the context says so explicitly — the contract
+    instructions tell the model that means ask, never invent a number.
+    """
+    if not DRAFT_BILL_HINT_PATTERN.search(message_text or ""):
+        return ""
+
+    message_words = set(re.findall(r"\w+", (message_text or "").lower()))
+    if not message_words:
+        return ""
+
+    matched_customers = []
+    for customer in Customer.objects.filter(business=business):
+        name_words = re.findall(r"\w+", customer.name.lower())
+        if not name_words:
+            continue
+        if len(name_words) == 1 and len(name_words[0]) < 2:
+            continue
+        if all(word in message_words for word in name_words):
+            matched_customers.append(customer)
+
+    message_item_words = _item_words(message_text)
+    if not message_item_words:
+        return ""
+
+    lines = []
+    has_complete_local_match = False
+
+    if matched_customers:
+        # Several name matches is ambiguous for a customer-scoped ledger
+        # lookup the same way it is everywhere else in this file — only act
+        # on a single, clear match.
+        customer = matched_customers[0] if len(matched_customers) == 1 else None
+        if customer is not None:
+            recent = _distinct_recent_items(
+                SaleLineItem.objects.filter(
+                    entry__business=business, entry__customer=customer, entry__type="sale",
+                ),
+                limit=15,
+            )
+            # A COMPLETE match — every word the owner used is part of this
+            # one item's own name — not just any shared word. "20mm black"
+            # and "20mm flat" both share "20mm" but are different items at
+            # (very plausibly) different rates; treating that partial
+            # overlap as "found it" would silently let one variant's rate
+            # answer for a different variant the owner actually asked about.
+            # Only a full match is grounds to stop searching.
+            # Direction matters: the MESSAGE also contains words that are
+            # never part of an item's own name at all (the quantity, the
+            # customer's name, filler) — requiring the whole message to fit
+            # inside one item's name would almost never be true. What has
+            # to hold is the other way round: every word THAT ITEM is
+            # called must appear somewhere in the message, e.g. "20mm
+            # black" only matches when both "20mm" and "black" were said.
+            has_complete_local_match = any(
+                _item_words(name) <= message_item_words for name in recent
+            )
+            if recent:
+                lines.append(
+                    f"{wrap_untrusted(customer.name)}'s own recent items and the rate each was LAST "
+                    "sold at (use these FIRST whenever the owner names an item with no rate, or only a "
+                    "partial description like a color/size alone — match it against these real names, "
+                    "e.g. \"black\" + an item already called \"20mm black\" here means that item. "
+                    "Items that share a word but are NOT a full match are DIFFERENT items — \"20mm "
+                    "black\" and \"20mm flat\" are not each other and must never share a rate): "
+                    + ", ".join(f"{wrap_untrusted(n)}={r}" for n, r in recent.items())
+                )
+
+    # Widen to the rest of the business unless this customer already has a
+    # COMPLETE match — the item may be one THIS customer has never bought
+    # before but someone else has, at a rate the business actually charges.
+    # A merely partial local match (shares one word, not the whole item) is
+    # not grounds to stop looking — see the comment above.
+    if not has_complete_local_match:
+        other_items = SaleLineItem.objects.filter(entry__business=business, entry__type="sale")
+        if matched_customers:
+            other_items = other_items.exclude(entry__customer__in=matched_customers)
+        word_query = Q()
+        for word in message_item_words:
+            word_query |= Q(item_name__icontains=word)
+        other_recent = _distinct_recent_items(other_items.filter(word_query), limit=10)
+        if other_recent:
+            lines.append(
+                "Items matching a word in this message, sold to OTHER customers (some may share only "
+                "one word with what the owner said and be a DIFFERENT item, e.g. \"20mm flat\" is not "
+                "\"20mm black\" — only use one whose full description genuinely matches; otherwise ask "
+                "which item is meant rather than picking the closest-sounding one): "
+                + ", ".join(f"{wrap_untrusted(n)}={r}" for n, r in other_recent.items())
+            )
+
+    if not lines:
+        return ""
+    return "\n\n" + "\n".join(lines)
 
 # Signals an edit/transfer/correction request rather than a new sale — these
 # get both the entry-lookup context (see `build_entry_context`) and the
@@ -402,8 +561,36 @@ matching exactly this shape, no other text outside the JSON:
     "opening_balance": "number, default 0 - ONLY if the owner explicitly stated an existing balance
       this customer already owes/is owed, e.g. 'purana 5000 baaki hai uska'",
     "summary": "string - e.g. 'Add new customer Bilal, 0300-1234567'"
+  },
+  "draft_payment": null or {
+    "customer_id": "string or null - an existing customer's id if you matched one",
+    "customer_name_guess": "string - only if customer_id is null, your best guess at the name",
+    "full_balance": "boolean, default false - true when the owner means their ENTIRE current
+      balance ('puri payment kar di', 'poora paisa de diya', 'uska balance khtm/clear kar do')
+      rather than a specific number. You do NOT know their exact balance and must NEVER guess or
+      compute it — leave amount null and set full_balance true; the server resolves the real figure
+      at confirm time from the actual ledger.",
+    "amount": "number or null - the payment amount, REQUIRED when full_balance is false. Only use a
+      number the owner actually stated ('Ali ne 5000 diye'). Never estimate, round, or infer one.",
+    "method": "'cash'|'bank'|'jazzcash'|'easypaisa' or null - only if the owner said how",
+    "summary": "string - e.g. 'Record Ali's full outstanding balance as paid' or 'Record 5,000 PKR
+      payment from Ali'"
   }
 }
+ITEM RATES AND NAMES. The owner often names an item and a quantity but not a rate ("26,000 likhdo,
+Kashan ka 20mm"), or names only part of an item ("black wali" after already saying "20mm" earlier in
+this conversation, meaning the one item "20mm black" together). You are NEVER to invent a rate or
+guess at completing an item's name from nothing. Instead:
+  1. Check "own recent items" context below (if present) for an item name that matches what the
+     owner said — including a partial match like a color/size alone matching one word of a longer
+     real item name. Use that item's exact name and its last-charged rate.
+  2. If nothing there matches, check "items sold to OTHER customers" context below (if present) the
+     same way.
+  3. If neither has a genuine match, do NOT set draft_bill. Ask in "text" which item is meant and/or
+     what the rate is — naming the part you couldn't resolve, not a vague "please clarify".
+A rate the owner DID state in this message always wins over any historical one — history is only
+for filling in what they left out, never for overriding what they actually said.
+
 DATES. Entries may be dated in the past, today, or the future — a future date is a planned bill,
 which is allowed. When the owner names a date ("yesterday", "on 25 July", "dated 1 August",
 "for tomorrow"), put it in draft_bill.date as YYYY-MM-DD, worked out from "Today's date" below.
@@ -449,8 +636,14 @@ unclear name is asked about rather than guessed. Only set draft_customer when th
 new person. The server re-checks for near-duplicates before creating anything regardless, so this
 is about avoiding an unnecessary question, not the only safeguard.
 
-draft_bill, document_ready, draft_document, draft_action and draft_customer are mutually exclusive
-and all optional (null when not applicable - many replies have none of them, just text). A reply
+PAYMENTS WITHOUT A SALE. "Ali ne apni puri payment kar di, uska balance khtm kar do", "Sara ne 5000
+diye" — these are NOT a sale (no items were bought), so they are NEVER draft_bill. Use draft_payment.
+"puri"/"poora"/"khtm"/"clear" language means the WHOLE balance — set full_balance true and leave
+amount null (see draft_payment's own field notes for why you must not compute the number yourself).
+A stated number ("5000 diye", "10 hazar jama kiye") means amount, with full_balance false.
+
+draft_bill, document_ready, draft_document, draft_action, draft_customer and draft_payment are
+mutually exclusive and all optional (null when not applicable - many replies have none of them, just text). A reply
 carrying more than one is rejected outright and the owner sees nothing. Keep replies short and
 WhatsApp-style.
 
@@ -789,7 +982,10 @@ def build_current_draft_context(conversation):
     message = (
         conversation.messages
         .filter(sender="ai", draft_confirmed=False)
-        .exclude(draft_bill=None, draft_action=None, draft_document=None, draft_customer=None)
+        .exclude(
+            draft_bill=None, draft_action=None, draft_document=None,
+            draft_customer=None, draft_payment=None,
+        )
         .order_by("-timestamp", "-id")
         .first()
     )
@@ -804,6 +1000,8 @@ def build_current_draft_context(conversation):
         kind, payload = "document", message.draft_document
     elif message.draft_customer:
         kind, payload = "customer", message.draft_customer
+    elif message.draft_payment:
+        kind, payload = "payment", message.draft_payment
     else:
         return ""
 
@@ -829,6 +1027,7 @@ def build_system_prompt(business, message_text="", language=None, conversation=N
     language_name = LANGUAGE_NAMES.get(language, "English")
     entry_context = build_entry_context(business, message_text) if needs_entry_context(message_text) else ""
     aggregate_context = build_aggregate_context(business) if needs_aggregate_context(message_text) else ""
+    item_price_context = build_item_price_context(business, message_text)
     draft_context = build_current_draft_context(conversation) if conversation is not None else ""
     script_rule = SCRIPT_RULES.get(language, ENGLISH_SCRIPT_RULE)
     return (
@@ -841,6 +1040,7 @@ def build_system_prompt(business, message_text="", language=None, conversation=N
         f"{build_business_context(business)}"
         f"{entry_context}"
         f"{aggregate_context}"
+        f"{item_price_context}"
         f"{draft_context}"
     )
 
@@ -881,5 +1081,6 @@ def _reply_to_json_string(msg):
             # for one unchanged request, and finally an invented document_url.
             "draft_document": msg.draft_document,
             "draft_customer": msg.draft_customer,
+            "draft_payment": msg.draft_payment,
         }
     )

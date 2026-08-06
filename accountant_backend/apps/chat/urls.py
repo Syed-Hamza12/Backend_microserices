@@ -37,4 +37,9 @@ urlpatterns = [
         views.ConfirmDraftCustomerView.as_view(),
         name="confirm-draft-customer",
     ),
+    path(
+        "chat/draft/<int:message_id>/confirm-payment/",
+        views.ConfirmDraftPaymentView.as_view(),
+        name="confirm-draft-payment",
+    ),
 ]

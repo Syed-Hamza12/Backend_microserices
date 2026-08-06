@@ -11,17 +11,19 @@ from decimal import Decimal
 from unittest import mock
 
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from apps.accounts.models import Business, User
 from apps.customers.models import Customer
-from apps.sales.models import ActivityEntry
+from apps.sales.models import ActivityEntry, SaleLineItem
 
 from . import services
 from .models import ChatMessage, Conversation
 from .prompt import (
     UNTRUSTED_CLOSE,
     build_entry_context,
+    build_item_price_context,
     build_messages,
     build_system_prompt,
     needs_reasoning,
@@ -160,6 +162,114 @@ class ConfirmDraftCustomerTests(APITestCase):
         self.assertEqual(second.status_code, 400)
         self.assertEqual(second.json()["error"]["code"], "ALREADY_CONFIRMED")
         self.assertEqual(Customer.objects.filter(business=self.business, name="Bilal").count(), 1)
+
+
+class ConfirmDraftPaymentTests(APITestCase):
+    """Standalone payments via chat (`draft_payment`) — "Ali ne apni puri
+    payment kar di, uska balance khtm kar do" and "Sara ne 5000 diye" style
+    requests. Before this existed there was no execution path for either at
+    all (see DraftPaymentSerializer's docstring)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="p@x.com", email="p@x.com", password="pw")
+        self.business = Business.objects.create(owner=self.user, business_name="Test Shop")
+        self.customer = Customer.objects.create(
+            business=self.business, name="Ali", phone="923000000000",
+            opening_balance=Decimal("2000"), current_balance=Decimal("2000"),
+        )
+        self.conversation = Conversation.objects.create(business=self.business)
+        self.client.force_authenticate(user=self.user)
+
+    def _message(self, **draft_payment):
+        return ChatMessage.objects.create(
+            conversation=self.conversation,
+            sender="ai",
+            text="Record the payment?",
+            draft_payment={
+                "customer_id": str(self.customer.id), "full_balance": False,
+                "amount": None, "method": None, **draft_payment,
+            },
+        )
+
+    def test_full_balance_resolves_the_real_amount_server_side(self):
+        # The model never states a number for "puri payment" — this proves
+        # the server, not the model, decides what "full" actually means.
+        message = self._message(full_balance=True, amount=None)
+        response = self.client.post(f"/api/chat/draft/{message.id}/confirm-payment/")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["data"]["amount"], "2000.00")
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.current_balance, Decimal("0"))
+
+    def test_a_stated_amount_is_used_as_is(self):
+        message = self._message(full_balance=False, amount=500)
+        response = self.client.post(f"/api/chat/draft/{message.id}/confirm-payment/")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.current_balance, Decimal("1500"))
+
+    def test_full_balance_with_nothing_owed_is_refused(self):
+        self.customer.current_balance = Decimal("0")
+        self.customer.save(update_fields=["current_balance"])
+        message = self._message(full_balance=True, amount=None)
+        response = self.client.post(f"/api/chat/draft/{message.id}/confirm-payment/")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "NOTHING_TO_CLEAR")
+
+    def test_double_confirm_records_only_one_payment(self):
+        message = self._message(full_balance=True, amount=None)
+        first = self.client.post(f"/api/chat/draft/{message.id}/confirm-payment/")
+        second = self.client.post(f"/api/chat/draft/{message.id}/confirm-payment/")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 400)
+        self.assertEqual(second.json()["error"]["code"], "ALREADY_CONFIRMED")
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.current_balance, Decimal("0"))
+
+
+class GenerateReplyPersistsEveryDraftFieldTests(TestCase):
+    """Regression: draft_customer/draft_payment were validated by
+    AiReplySerializer and even linked to a real customer, but
+    ChatMessage.objects.create in generate_reply never actually passed them
+    through — a model proposing either would have it silently vanish before
+    ever reaching the mobile app. Caught while wiring draft_payment in."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="gr@x.com", email="gr@x.com", password="pw")
+        self.business = Business.objects.create(owner=self.user, business_name="Test Shop", language="en")
+        self.conversation = Conversation.objects.create(business=self.business)
+
+    def _payload(self, **overrides):
+        base = {
+            "text": "ok", "speech_text": None, "draft_bill": None, "document_ready": None,
+            "draft_action": None, "draft_document": None, "draft_customer": None, "draft_payment": None,
+        }
+        base.update(overrides)
+        return json.dumps(base)
+
+    def test_draft_customer_is_persisted(self):
+        payload = self._payload(draft_customer={
+            "name": "Bilal", "phone": None, "opening_balance": 0, "summary": "Add Bilal",
+        })
+        with mock.patch("apps.chat.services.call_groq", return_value=payload):
+            reply = services.generate_reply(
+                business=self.business, conversation=self.conversation, text="add customer Bilal",
+            )
+        self.assertIsNotNone(reply.draft_customer)
+        self.assertEqual(reply.draft_customer["name"], "Bilal")
+
+    def test_draft_payment_is_persisted(self):
+        payload = self._payload(draft_payment={
+            "customer_id": None, "customer_name_guess": "Ali", "full_balance": True,
+            "amount": None, "method": None, "summary": "Clear Ali's balance",
+        })
+        with mock.patch("apps.chat.services.call_groq", return_value=payload):
+            reply = services.generate_reply(
+                business=self.business, conversation=self.conversation,
+                text="Ali ne apni puri payment kar di, uska balance khtm kar do",
+            )
+        self.assertIsNotNone(reply.draft_payment)
+        self.assertTrue(reply.draft_payment["full_balance"])
 
 
 class SaveNowTests(TestCase):
@@ -762,6 +872,79 @@ class PromptContainmentTests(TestCase):
         )
         context = build_entry_context(self.business, "change the Ali payment")
         self.assertIn("entry_id=", context)
+
+
+class ItemPriceContextTests(TestCase):
+    """"26,000 likhdo, Kashan ka 20mm" states a quantity and item but no
+    rate; "5,000 likhdo black wali" names only part of an item. The model
+    must resolve both from real sale history — this customer's own items
+    first, then the rest of the business — never invent a number. Verifies
+    the priority order end to end, not just that the regex matches."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="ip@x.com", email="ip@x.com", password="pw")
+        self.business = Business.objects.create(owner=self.user, business_name="Hardware Shop")
+        self.kashan = Customer.objects.create(business=self.business, name="Kashan", phone="923000000001")
+        self.ali = Customer.objects.create(business=self.business, name="Ali", phone="923000000002")
+
+    def _sale(self, customer, item_name, rate):
+        entry = ActivityEntry.objects.create(
+            business=self.business, customer=customer, type="sale",
+            amount=Decimal("100"), balance_after=Decimal("100"), timestamp=timezone.now(),
+        )
+        SaleLineItem.objects.create(entry=entry, item_name=item_name, quantity=Decimal("10"), rate=rate)
+
+    def test_prioritises_the_named_customers_own_item_rate(self):
+        self._sale(self.kashan, "20mm", Decimal("5"))
+        self._sale(self.ali, "20mm", Decimal("999"))  # a different rate for a different customer
+
+        context = build_item_price_context(self.business, "26,000 likhdo, kashan ka 20 mm")
+        self.assertIn("own recent items", context)
+        self.assertIn("20mm", context)
+        self.assertIn("5.00", context)
+        # Ali's rate for the same item name must not leak into Kashan's bill.
+        self.assertNotIn("999", context)
+
+    def test_falls_back_to_other_customers_when_this_one_has_no_match(self):
+        self._sale(self.ali, "23mm", Decimal("8"))  # Kashan has never bought this
+        context = build_item_price_context(self.business, "400 likhdo kashan ka 23mm")
+        self.assertIn("OTHER customers", context)
+        self.assertIn("23mm", context)
+        self.assertIn("8.00", context)
+
+    def test_matches_a_partial_descriptor_against_a_real_item_name(self):
+        self._sale(self.ali, "20mm black", Decimal("12"))
+        context = build_item_price_context(self.business, "5,000 likhdo black wali Ali ko")
+        self.assertIn("20mm black", context)
+        self.assertIn("12.00", context)
+
+    def test_a_shared_word_does_not_count_as_finding_the_specific_variant(self):
+        # Kashan has bought "20mm flat" — NOT "20mm black". The owner now
+        # asks about "20mm black" for Kashan. "20mm" is shared between the
+        # two item names but they are different items at (here) different
+        # rates; the partial overlap must not be treated as a match found,
+        # or Kashan's real "20mm flat" rate could get reused for "20mm
+        # black" by mistake. It must keep searching and find Ali's real
+        # "20mm black" instead.
+        self._sale(self.kashan, "20mm flat", Decimal("5"))
+        self._sale(self.ali, "20mm black", Decimal("12"))
+
+        context = build_item_price_context(self.business, "5,000 likhdo kashan ka 20mm black")
+        self.assertIn("OTHER customers", context)
+        self.assertIn("20mm black", context)
+        self.assertIn("12.00", context)
+        # Kashan's own (different-variant) item is still shown for
+        # reference, but its rate is 5 — assert the OTHER-customers section
+        # is what actually carries the real "20mm black" match.
+        self.assertIn("5.00", context)  # Kashan's own "20mm flat" is listed too, harmlessly
+
+    def test_no_context_when_nothing_matches_anywhere(self):
+        context = build_item_price_context(self.business, "26,000 likhdo kashan ka 20mm")
+        self.assertEqual(context, "")
+
+    def test_no_context_outside_a_billing_message(self):
+        self._sale(self.kashan, "20mm", Decimal("5"))
+        self.assertEqual(build_item_price_context(self.business, "kashan ka balance kya hai"), "")
 
 
 class ConversationHistoryTests(APITestCase):

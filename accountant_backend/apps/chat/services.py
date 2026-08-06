@@ -247,6 +247,30 @@ def link_drafted_customer(business, draft_bill):
     draft_bill["customer_name"] = customer.name
 
 
+def link_drafted_payment_customer(business, draft_payment):
+    """Same as `link_drafted_customer` but for a `draft_payment` — resolves
+    `customer_name_guess` to a real `customer_id` in place, so the card
+    shows a name immediately rather than waiting for confirm-time linking
+    to discover the same match."""
+    if not isinstance(draft_payment, dict):
+        return
+
+    if not draft_payment.get("customer_id"):
+        customer, _candidates = matching.find_matching_customer(
+            business, draft_payment.get("customer_name_guess")
+        )
+        if not customer:
+            return
+        draft_payment["customer_id"] = str(customer.id)
+        draft_payment["customer_name_guess"] = None
+    else:
+        customer = Customer.objects.filter(business=business, pk=draft_payment["customer_id"]).first()
+        if not customer:
+            return
+
+    draft_payment["customer_name"] = customer.name
+
+
 def record_drafted_bill(business, message):
     """Records `message.draft_bill` on the ledger immediately, skipping Confirm.
 
@@ -536,6 +560,7 @@ def generate_reply(*, business, conversation, text, language=None):
     # Roman Urdu path entirely; an empty result means "stay silent", which is a
     # far better outcome than gibberish.
     link_drafted_customer(business, reply_data.get("draft_bill"))
+    link_drafted_payment_customer(business, reply_data.get("draft_payment"))
 
     # For ur/roman_ur, the JSON step's own "text" is NEVER the final reply —
     # it is stored here only as a placeholder until the response-writer step
@@ -552,6 +577,13 @@ def generate_reply(*, business, conversation, text, language=None):
         document_ready=reply_data.get("document_ready"),
         draft_action=reply_data.get("draft_action"),
         draft_document=reply_data.get("draft_document"),
+        # These two were missing entirely until now: draft_customer/draft_payment
+        # were validated by AiReplySerializer and even linked to a real customer
+        # above, but never actually written to the ChatMessage row — so the
+        # model could propose one and it would silently vanish, never reaching
+        # the mobile app at all. Caught while wiring draft_payment in.
+        draft_customer=reply_data.get("draft_customer"),
+        draft_payment=reply_data.get("draft_payment"),
         # Marked so this apology isn't replayed into later prompts as if it were
         # a real assistant turn — feeding "sorry, I couldn't process that" back
         # as context teaches the model to produce more of the same.

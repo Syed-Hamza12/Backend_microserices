@@ -69,6 +69,12 @@ class ChatMessage(models.Model):
     # Mutually exclusive with the three drafts above, same "only one of these,
     # or none" rule, and confirmed the same way (ConfirmDraftCustomerView).
     draft_customer = models.JSONField(null=True, blank=True)
+    # AI-proposed *standalone* payment (no accompanying sale) — see
+    # apps.chat.serializers.DraftPaymentSerializer. Mutually exclusive with
+    # the drafts above, confirmed via ConfirmDraftPaymentView, which resolves
+    # the real amount server-side when `full_balance` is set rather than
+    # trusting any number the model wrote.
+    draft_payment = models.JSONField(null=True, blank=True)
     # A date/date-range the owner asked about across MULTIPLE customers
     # ("pichle hafte ki detail batao", "10 se 20 tareek ka hisaab") — set
     # deterministically by apps.chat.services (never by the model, same

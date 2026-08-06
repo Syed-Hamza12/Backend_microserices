@@ -123,6 +123,47 @@ class DraftCustomerSerializer(serializers.Serializer):
     summary = serializers.CharField()
 
 
+class DraftPaymentSerializer(serializers.Serializer):
+    """An AI-proposed *standalone* payment — no accompanying sale — for
+    "Ali ne apni puri payment kar di, uska balance khtm karo" style requests.
+
+    Before this existed there was no way to express this at all: draft_bill
+    requires a real `total_amount` because it represents a sale, and the
+    registered `record_payment` agent capability was never actually reachable
+    from a chat message (only ever composed as part of a document chain).
+    That gap meant a message like this could only produce a fabricated
+    phantom sale (to net the balance to zero) or a bare text claim of
+    "balance cleared" with nothing written to the ledger — exactly the class
+    of hallucinated confirmation this codebase exists to prevent everywhere
+    else, just not here yet.
+
+    `full_balance=True` covers "puri payment" / "poora paisa de diya" (the
+    ENTIRE current balance, not a specific number the owner stated) — the
+    model is deliberately NOT trusted to read or compute that number itself
+    (see prompt.py's "server resolves it" pattern for dates/balances); it
+    only has to recognise the intent. `amount` is required precisely when
+    `full_balance` is False, and is ignored (recomputed server-side) when
+    it's True.
+    """
+
+    customer_id = serializers.CharField(allow_null=True, required=False)
+    customer_name_guess = serializers.CharField(allow_null=True, required=False, allow_blank=True)
+    # The matched customer's real name, filled server-side once linked (never
+    # by the model) — same reasoning as DraftBillSerializer.customer_name.
+    customer_name = serializers.CharField(allow_null=True, required=False, allow_blank=True)
+    full_balance = serializers.BooleanField(required=False, default=False)
+    amount = serializers.FloatField(required=False, allow_null=True)
+    method = serializers.ChoiceField(
+        choices=["cash", "bank", "jazzcash", "easypaisa"], required=False, allow_null=True
+    )
+    summary = serializers.CharField()
+
+    def validate(self, attrs):
+        if not attrs.get("full_balance") and attrs.get("amount") is None:
+            raise serializers.ValidationError("amount is required unless full_balance is true.")
+        return attrs
+
+
 class AiReplySerializer(serializers.Serializer):
     text = serializers.CharField()
     speech_text = serializers.CharField(allow_null=True, required=False, allow_blank=True)
@@ -131,16 +172,20 @@ class AiReplySerializer(serializers.Serializer):
     draft_action = DraftActionSerializer(allow_null=True, required=False)
     draft_document = DraftDocumentSerializer(allow_null=True, required=False)
     draft_customer = DraftCustomerSerializer(allow_null=True, required=False)
+    draft_payment = DraftPaymentSerializer(allow_null=True, required=False)
 
     def validate(self, attrs):
         present = [
-            k for k in ("draft_bill", "document_ready", "draft_action", "draft_document", "draft_customer")
+            k for k in (
+                "draft_bill", "document_ready", "draft_action",
+                "draft_document", "draft_customer", "draft_payment",
+            )
             if attrs.get(k)
         ]
         if len(present) > 1:
             raise serializers.ValidationError(
-                "draft_bill, document_ready, draft_action, draft_document and draft_customer "
-                "are mutually exclusive."
+                "draft_bill, document_ready, draft_action, draft_document, draft_customer and "
+                "draft_payment are mutually exclusive."
             )
         return attrs
 
@@ -166,6 +211,7 @@ class ChatMessageSerializer(serializers.ModelSerializer):
             "draft_action",
             "draft_document",
             "draft_customer",
+            "draft_payment",
             "report_view",
             "pending_delivery_id",
             "is_error_fallback",

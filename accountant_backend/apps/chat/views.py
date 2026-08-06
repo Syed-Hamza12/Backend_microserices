@@ -979,3 +979,136 @@ class ConfirmDraftCustomerView(APIView):
                 },
             }
         )
+
+
+class ConfirmDraftPaymentView(APIView):
+    """Confirms an AI-proposed *standalone* payment (`draft_payment`) — the
+    "Ali ne apni puri payment kar di, uska balance khtm kar do" case, which
+    had no execution path at all before this existed (see
+    apps.chat.serializers.DraftPaymentSerializer's docstring for the gap).
+
+    `full_balance` is resolved to a real number HERE, from the customer's
+    actual `current_balance` at confirm time — never from anything the model
+    wrote. The model was told never to guess this figure; this is the
+    enforcement of that, the same "server resolves the fact, not the model"
+    pattern as every date/balance/delivery-status check elsewhere in this
+    module. A customer with a zero or negative balance has nothing to clear,
+    so that case is rejected rather than silently recording a zero payment.
+    """
+
+    def post(self, request, message_id):
+        try:
+            business = request.user.business
+        except Business.DoesNotExist:
+            return Response(
+                {"success": False, "error": {"code": "NO_BUSINESS", "message": "No business created yet."}},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            message = ChatMessage.objects.get(pk=message_id, conversation__business=business, sender="ai")
+        except ChatMessage.DoesNotExist:
+            return Response(
+                {"success": False, "error": {"code": "NOT_FOUND", "message": "Message not found."}},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not message.draft_payment:
+            return Response(
+                {"success": False, "error": {"code": "NO_DRAFT_PAYMENT", "message": "This message has no payment proposal."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        claimed = ChatMessage.objects.filter(pk=message.pk, draft_confirmed=False).update(draft_confirmed=True)
+        if not claimed:
+            return Response(
+                {"success": False, "error": {"code": "ALREADY_CONFIRMED", "message": "This was already confirmed."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        message.draft_confirmed = True
+
+        draft = message.draft_payment
+
+        # customer_id may still be unset (an unclear name the model couldn't
+        # match) even after link_drafted_payment_customer's best effort at
+        # reply-generation time — re-try once more here for the same reason
+        # ConfirmDraftBillView does: the owner may have edited nothing, and a
+        # draft that can never be confirmed is a dead end for them.
+        if not draft.get("customer_id"):
+            services.link_drafted_payment_customer(business, draft)
+            if draft.get("customer_id"):
+                message.draft_payment = draft
+                message.save(update_fields=["draft_payment"])
+
+        try:
+            customer = Customer.objects.get(business=business, pk=draft.get("customer_id"))
+        except (Customer.DoesNotExist, ValueError, TypeError):
+            _release_draft_claim(message)
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": "CUSTOMER_NOT_MATCHED",
+                        "message": "This payment isn't linked to a real customer yet.",
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if draft.get("full_balance"):
+            if customer.current_balance <= 0:
+                _release_draft_claim(message)
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "NOTHING_TO_CLEAR",
+                            "message": f"{customer.name} has no outstanding balance to record a payment against.",
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            amount = customer.current_balance
+        else:
+            try:
+                amount = Decimal(str(draft.get("amount"))).quantize(Decimal("0.01"))
+            except (InvalidOperation, TypeError):
+                _release_draft_claim(message)
+                return Response(
+                    {"success": False, "error": {"code": "INVALID_DRAFT", "message": "The payment amount isn't valid."}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if amount < MIN_MONEY or amount > MAX_MONEY:
+                _release_draft_claim(message)
+                return Response(
+                    {"success": False, "error": {"code": "INVALID_DRAFT", "message": "The payment amount isn't valid."}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        try:
+            entry = sales_services.record_payment(
+                business=business,
+                customer=customer,
+                amount=amount,
+                method=draft.get("method"),
+                created_by="ai_chat",
+            )
+        except Exception:  # noqa: BLE001 - draft must stay editable/unconfirmed on any save failure
+            _release_draft_claim(message)
+            return Response(
+                {"success": False, "error": {"code": "SAVE_FAILED", "message": "Could not record the payment. Please try again."}},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        sales_services.log_ai_created_sale(entry=entry, source_message_id=message.id)
+
+        return Response(
+            {
+                "success": True,
+                "data": {
+                    "message": ChatMessageSerializer(message).data,
+                    "entry_id": entry.id,
+                    "amount": str(amount),
+                },
+            }
+        )
