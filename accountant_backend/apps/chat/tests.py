@@ -315,7 +315,7 @@ class SaveNowTests(TestCase):
     def test_an_explicit_save_records_the_sale_without_a_confirm_tap(self):
         saved, message = self._attempt(self.valid)
 
-        self.assertTrue(saved)
+        self.assertEqual(saved, "saved")
         entry = ActivityEntry.objects.get(business=self.business, type="sale")
         self.assertEqual(entry.amount, Decimal("1000.00"))
         # Marked confirmed so the card cannot then be confirmed a second time,
@@ -333,10 +333,30 @@ class SaveNowTests(TestCase):
         ]:
             with self.subTest(case=label):
                 saved, message = self._attempt(draft)
-                self.assertFalse(saved)
+                self.assertEqual(saved, "failed")
                 self.assertFalse(ActivityEntry.objects.filter(business=self.business).exists())
                 # Left unconfirmed so the owner can still fix it and confirm.
                 self.assertFalse(message.draft_confirmed)
+
+    def test_an_identical_sale_saved_moments_ago_is_not_recorded_again(self):
+        first_saved, _ = self._attempt(self.valid)
+        self.assertEqual(first_saved, "saved")
+
+        second_saved, second_message = self._attempt(self.valid)
+
+        self.assertEqual(second_saved, "duplicate")
+        self.assertEqual(ActivityEntry.objects.filter(business=self.business, type="sale").count(), 1)
+        self.assertFalse(second_message.draft_confirmed)
+
+    def test_a_second_order_with_different_items_is_recorded_normally(self):
+        first_saved, _ = self._attempt(self.valid)
+        self.assertEqual(first_saved, "saved")
+
+        different = {**self.valid, "items": [{"item_name": "Rice", "quantity": 5, "rate": 500}], "total_amount": 2500.0}
+        second_saved, _ = self._attempt(different)
+
+        self.assertEqual(second_saved, "saved")
+        self.assertEqual(ActivityEntry.objects.filter(business=self.business, type="sale").count(), 2)
 
 
 class DraftBillEditPersistenceTests(APITestCase):

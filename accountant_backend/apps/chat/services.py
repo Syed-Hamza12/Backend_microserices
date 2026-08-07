@@ -273,6 +273,43 @@ def link_drafted_payment_customer(business, draft_payment):
     draft_payment["customer_name"] = customer.name
 
 
+#: How recent a matching sale has to be to count as a likely accidental
+#: repeat of THIS save_now request, not a genuine second order the owner
+#: placed shortly after the first. Short on purpose — a real repeat order
+#: ("same 2 packets again tomorrow") is common and must never be blocked;
+#: this only catches the case of the same instruction landing twice within
+#: the same conversational turn (a double-tap, a retried message, the model
+#: re-emitting save_now on a message that already went through).
+DUPLICATE_SALE_WINDOW_MINUTES = 15
+
+
+def _find_recent_matching_sale(business, customer, items, payment_received):
+    """The most recent sale for this customer, in the last
+    `DUPLICATE_SALE_WINDOW_MINUTES`, with the same item names/quantities and
+    the same amount received — i.e. one that looks like the exact same bill
+    save_now is about to write again. None if nothing matches."""
+    from apps.sales.models import ActivityEntry
+
+    cutoff = timezone.now() - timezone.timedelta(minutes=DUPLICATE_SALE_WINDOW_MINUTES)
+    candidate_key = sorted(
+        (li["item_name"], str(li["quantity"]), str(li["rate"])) for li in items
+    )
+    recent_sales = (
+        ActivityEntry.objects.filter(
+            business=business, customer=customer, type="sale", created_at__gte=cutoff,
+        )
+        .prefetch_related("line_items")
+        .order_by("-created_at")[:5]
+    )
+    for entry in recent_sales:
+        entry_key = sorted(
+            (li.item_name, str(li.quantity), str(li.rate)) for li in entry.line_items.all()
+        )
+        if entry_key == candidate_key:
+            return entry
+    return None
+
+
 def record_drafted_bill(business, message):
     """Records `message.draft_bill` on the ledger immediately, skipping Confirm.
 
@@ -284,8 +321,14 @@ def record_drafted_bill(business, message):
     Every guard the Confirm button relies on is deliberately kept, because none
     of them were about the tap: the same `build_sale_from_draft` validation, the
     same requirement that a real customer is linked, and the same audit row
-    recording that the AI created this entry. Returns True only if money was
-    actually written.
+    recording that the AI created this entry.
+
+    Returns "saved" only if money was actually written, "duplicate" if an
+    identical sale for this customer was already recorded moments ago (see
+    `_find_recent_matching_sale` — this is the save_now path's equivalent of
+    the owner's own "is this a repeat order or the same one already saved?"
+    question, done automatically since save_now never shows a review step),
+    or "failed" for a validation/DB error.
 
     Deliberately does NOT send anything on WhatsApp. The owner asked to save,
     and delivery is a separate decision — see `queue_invoice_send`'s caller.
@@ -301,13 +344,20 @@ def record_drafted_bill(business, message):
         # Nothing to attach the money to. The draft stays unconfirmed so the
         # owner can pick a customer and confirm by hand.
         logger.info("save_now skipped: draft on message %s has no matched customer", message.id)
-        return False
+        return "failed"
 
     try:
         items, payment_received, business_date = build_sale_from_draft(draft)
     except ValueError as exc:
         logger.warning("save_now rejected on message %s: %s", message.id, exc)
-        return False
+        return "failed"
+
+    if _find_recent_matching_sale(business, customer, items, payment_received) is not None:
+        logger.info(
+            "save_now skipped: an identical sale for customer %s was recorded in the last %s minutes",
+            customer.id, DUPLICATE_SALE_WINDOW_MINUTES,
+        )
+        return "duplicate"
 
     try:
         sale_entry, _payment = sales_services.record_sale(
@@ -321,13 +371,13 @@ def record_drafted_bill(business, message):
         )
     except Exception:  # noqa: BLE001 - a failed save must leave the draft confirmable by hand
         logger.exception("save_now failed to record the sale for message %s", message.id)
-        return False
+        return "failed"
 
     sales_services.log_ai_created_sale(entry=sale_entry, source_message_id=message.id)
     ChatMessage.objects.filter(pk=message.pk).update(draft_confirmed=True)
     message.draft_confirmed = True
     logger.info("save_now recorded sale %s from message %s", sale_entry.id, message.id)
-    return True
+    return "saved"
 
 
 def to_urdu_script(text):
@@ -591,6 +641,22 @@ def generate_reply(*, business, conversation, text, language=None):
         report_view_from_draft = _report_view_from_draft_document(draft_document)
         draft_document = None
 
+    # An invoice/receipt draft only works if the customer actually has a
+    # matching entry — ConfirmDraftDocumentView 400s otherwise, and since
+    # that failure is deterministic (not a race), every retap of "Confirm
+    # karein & Bhejein" would 400 identically. The model sometimes proposes
+    # one anyway (even while its own `text` says "no payment on record"), so
+    # this re-checks the same lookup the confirm view does and drops the
+    # draft rather than showing a Confirm button that can never succeed.
+    if isinstance(draft_document, dict) and draft_document.get("doc_type") in ("invoice", "receipt"):
+        from apps.documents.services import resolve_latest_entry_for_customer
+
+        customer_id = draft_document.get("customer_id")
+        entry_type = "sale" if draft_document["doc_type"] == "invoice" else "payment"
+        customer_obj = Customer.objects.filter(business=business, pk=customer_id).first() if customer_id else None
+        if customer_obj is None or resolve_latest_entry_for_customer(business, customer_obj, entry_type) is None:
+            draft_document = None
+
     ai_message = ChatMessage.objects.create(
         conversation=conversation,
         sender="ai",
@@ -617,20 +683,26 @@ def generate_reply(*, business, conversation, text, language=None):
     # Recorded only when the owner asked for it in words. Done after the message
     # exists so the audit row can point at the message that caused the entry.
     save_now_failed = False
+    save_now_duplicate = False
     draft = reply_data.get("draft_bill") or {}
     if draft.get("save_now") and not ai_failed:
-        if not record_drafted_bill(business, ai_message):
-            save_now_failed = True
+        save_result = record_drafted_bill(business, ai_message)
+        if save_result != "saved":
+            save_now_failed = save_result == "failed"
+            save_now_duplicate = save_result == "duplicate"
             if language not in _WRITER_LANGUAGES:
                 # English: no response-writer step runs below, so this must
                 # be said directly here, same as before. Say so rather than
                 # leaving the owner believing it is on the ledger — the reply
                 # text already claims it was saved, because the model was
                 # told to only set save_now when it means it.
-                ai_message.text = (
-                    f"{ai_message.text}\n\n(I could not record it automatically — "
-                    "please check the draft and confirm it.)"
+                note = (
+                    "(An identical bill for this customer was already recorded moments ago — "
+                    "not saved again. If this is a genuinely new order, please confirm it by hand.)"
+                    if save_now_duplicate
+                    else "(I could not record it automatically — please check the draft and confirm it.)"
                 )
+                ai_message.text = f"{ai_message.text}\n\n{note}"
                 ai_message.speech_text = None
                 ai_message.save(update_fields=["text", "speech_text"])
             # For ur/roman_ur this failure is folded into the execution
@@ -650,7 +722,13 @@ def generate_reply(*, business, conversation, text, language=None):
         # ONLY place a Roman Urdu/Urdu owner's final reply text comes from;
         # 8B (or 70B on the JSON step) never reaches the owner directly.
         summary = _build_execution_summary(reply_data)
-        if save_now_failed:
+        if save_now_duplicate:
+            summary = (summary + " " if summary else "") + (
+                "An identical bill for this customer was already recorded moments ago, so this one "
+                "was NOT saved again — tell the owner and ask whether it's a genuinely new/repeat "
+                "order (in which case they should confirm it by hand) or the same one they already saved."
+            )
+        elif save_now_failed:
             summary = (summary + " " if summary else "") + (
                 "The bill could NOT be recorded automatically due to an error — "
                 "ask the owner to check the draft and confirm/save it manually."

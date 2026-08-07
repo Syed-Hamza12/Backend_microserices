@@ -53,7 +53,7 @@ correctly than any Latin text mixed into this field."""
 # with no line items. \b is also useless against Urdu script (there are no
 # Latin word boundaries), hence the bare alternatives for the Urdu terms.
 DRAFT_BILL_HINT_PATTERN = re.compile(
-    r"\bbill\b|\binvoice\b|\bdraft\b|\bsold\b|\bsale\b|\bcharge\b|\brecord\b.*\bsale\b"
+    r"\bbill\b|\binvoice\b|\bdraft\b|\bsold\b|\bsale\b|\bcharge\b|\brecord\b.*\bsale\b|\brate\b|\brates\b"
     # Roman Urdu
     r"|\bbanao\b|\bbanana\b|\bbanaya\b|\bbana\b|\budhaar\b|\budhar\b|\bbecha\b|\bbechna\b"
     r"|\brakam\b|\bkharch\b|\bkitne\b|\bkitna\b|\bpaisay\b|\bpaise\b"
@@ -79,6 +79,14 @@ _ITEM_CONTEXT_STOPWORDS = {
     "likh", "likhdo", "likho", "do", "kardo", "kar", "karo", "ka", "ki", "ke", "ko",
     "wali", "wala", "wale", "aur", "and", "hai", "h", "de", "diya", "diye", "bill",
     "banao", "banana", "record", "sale", "sold", "charge", "raha", "rahi", "hoon",
+    # Continuation/pronoun filler ("uski 2 packet OR lagao" = "add 2 more
+    # packets FOR HIM") — "or" here is Roman Urdu "aur" (more/and), not the
+    # English word, and none of these ever name an item. Left in, "or" in
+    # particular used to widen the item search with an icontains match that
+    # hit almost anything (e.g. "Iron", "Mirror").
+    "or", "ab", "phir", "lagao", "lagado", "laga", "lagana", "uski", "uska",
+    "iski", "iska", "usko", "isko", "ussi", "issi", "rate", "rates", "deta",
+    "deti", "dete", "diya", "kya",
 }
 
 
@@ -114,7 +122,36 @@ def _distinct_recent_items(queryset, limit):
     return seen
 
 
-def build_item_price_context(business, message_text):
+def _last_conversation_customer(business, conversation):
+    """The customer_id from the most recent draft_bill/draft_document/
+    draft_payment in this conversation, confirmed or not.
+
+    A continuation message like "uski 2 packet or lagao" ("add 2 more
+    packets for him") never repeats the customer's name — it's a pronoun
+    referring to whoever the conversation was just about. Without this,
+    `build_item_price_context`'s customer match (which only looks at the
+    CURRENT message's own words) finds nobody, so it returns no rate/item
+    history at all and the model has nothing to ground a rate in but a
+    guess. Deliberately not limited to unconfirmed drafts the way
+    `build_current_draft_context` is — the previous bill may have already
+    been saved, and the owner is still clearly talking about that same
+    customer.
+    """
+    for message in (
+        conversation.messages.filter(sender="ai")
+        .exclude(draft_bill=None, draft_document=None, draft_payment=None)
+        .order_by("-timestamp", "-id")[:10]
+    ):
+        for payload in (message.draft_bill, message.draft_document, message.draft_payment):
+            if isinstance(payload, dict) and payload.get("customer_id"):
+                try:
+                    return Customer.objects.get(business=business, pk=payload["customer_id"])
+                except (Customer.DoesNotExist, ValueError, TypeError):
+                    continue
+    return None
+
+
+def build_item_price_context(business, message_text, conversation=None):
     """Real sale history for items the owner mentioned without a rate, or
     with only a partial name — the exact case a small model cannot resolve
     honestly on its own: "26,000 likhdo, Kashan ka 20mm" states a quantity
@@ -146,6 +183,15 @@ def build_item_price_context(business, message_text):
             continue
         if all(word in message_words for word in name_words):
             matched_customers.append(customer)
+
+    # No customer named in THIS message — check whether it's a pronoun-only
+    # continuation ("uski", "ab", "or lagao") of whoever the conversation
+    # was already about, rather than treating "no name here" as "no
+    # customer at all" and losing every bit of rate/item history.
+    if not matched_customers and conversation is not None:
+        last_customer = _last_conversation_customer(business, conversation)
+        if last_customer is not None:
+            matched_customers = [last_customer]
 
     message_item_words = _item_words(message_text)
     if not message_item_words:
@@ -190,7 +236,9 @@ def build_item_price_context(business, message_text):
                     "partial description like a color/size alone — match it against these real names, "
                     "e.g. \"black\" + an item already called \"20mm black\" here means that item. "
                     "Items that share a word but are NOT a full match are DIFFERENT items — \"20mm "
-                    "black\" and \"20mm flat\" are not each other and must never share a rate): "
+                    "black\" and \"20mm flat\" are not each other and must never share a rate. "
+                    "Listed MOST RECENT FIRST — when the owner names a quantity but no product at all "
+                    "(\"2 packet or lagao\"), the first item here is the one they mean): "
                     + ", ".join(f"{wrap_untrusted(n)}={r}" for n, r in recent.items())
                 )
 
@@ -608,6 +656,15 @@ guess at completing an item's name from nothing. Instead:
      what the rate is — naming the part you couldn't resolve, not a vague "please clarify".
 A rate the owner DID state in this message always wins over any historical one — history is only
 for filling in what they left out, never for overriding what they actually said.
+
+BARE "MORE OF IT" REQUESTS. "uski 2 packet or lagao" ("add 2 more packets for him"), "ussi ka 3 dabba
+phir se" — the owner names a QUANTITY but no product at all, because they mean "more of whatever he
+already buys/bought last". This is never license to invent an item literally called "2 packet" or
+"3 dabba" — those are units, not product names, and a made-up name with a made-up rate (e.g. "1 x 800")
+is exactly the hallucination you must never produce. Resolve the actual item from, in order: (1) the
+CURRENT ACTIVE DRAFT below if one exists, (2) this customer's own recent items context below — use
+the SINGLE most recent one listed, at its last-charged rate. If neither is available, do NOT guess a
+product or a rate — ask which item, naming the quantity you did understand.
 
 DATES. Entries may be dated in the past, today, or the future — a future date is a planned bill,
 which is allowed. When the owner names a date ("yesterday", "on 25 July", "dated 1 August",
@@ -1095,7 +1152,7 @@ def build_system_prompt(business, message_text="", language=None, conversation=N
     language_name = LANGUAGE_NAMES.get(language, "English")
     entry_context = build_entry_context(business, message_text) if needs_entry_context(message_text) else ""
     aggregate_context = build_aggregate_context(business) if needs_aggregate_context(message_text) else ""
-    item_price_context = build_item_price_context(business, message_text)
+    item_price_context = build_item_price_context(business, message_text, conversation=conversation)
     draft_context = build_current_draft_context(conversation) if conversation is not None else ""
     script_rule = SCRIPT_RULES.get(language, ENGLISH_SCRIPT_RULE)
     return (
