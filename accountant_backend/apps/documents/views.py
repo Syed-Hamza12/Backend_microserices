@@ -57,6 +57,30 @@ class DocumentFormatsView(APIView):
         )
 
 
+class ExportExcelView(APIView):
+    """Whole-ledger export: business name, then every customer's statement
+    one after another, then grand totals — the Settings > Data Export
+    button's only feature so far. Synchronous like RenderDocumentView since
+    it's a direct download, not a WhatsApp send."""
+
+    throttle_classes = [DocumentThrottle]
+
+    def get(self, request):
+        business, error = _business_or_error(request)
+        if error:
+            return error
+
+        from .excel_export import build_export_workbook
+
+        workbook_bytes = build_export_workbook(business)
+        response = HttpResponse(
+            workbook_bytes,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = 'attachment; filename="data_export.xlsx"'
+        return response
+
+
 class RenderDocumentView(APIView):
     """Renders a document and returns the file itself, for preview and sharing.
 
