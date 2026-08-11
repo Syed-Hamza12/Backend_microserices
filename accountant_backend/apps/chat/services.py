@@ -779,6 +779,21 @@ def generate_reply(*, business, conversation, text, language=None):
         _enforce_whatsapp_not_connected_notice(business, ai_message, text, language)
 
     if not ai_failed:
+        # Deliberately NOT gated on gateway_session_id, unlike the notice
+        # above: this business genuinely has WhatsApp linked, so that check
+        # never fires here — but "linked at some point" is not the same as
+        # "this specific bill actually went out", and the model has no real
+        # signal either way. Caught a real case: asked "WhatsApp m send
+        # hogya?" after a save_now bill, the model answered "Haan ji ...
+        # send ho raha hai" — a fabricated in-progress claim that dodges
+        # the prompt's existing "never say sent/delivered" wording by using
+        # present-continuous phrasing instead of past tense. Answers with
+        # the real DocumentDelivery status instead of deflecting — an
+        # owner asking this needs a real answer ("not sent, reconnect
+        # WhatsApp"), not "I can't see status, check the app".
+        _answer_delivery_status_question(business, ai_message, text, language)
+
+    if not ai_failed:
         _attach_report_view(business, ai_message, text)
 
     return ai_message
@@ -897,9 +912,20 @@ _DELIVERY_REASON_FALLBACK = "the bill could not be sent on WhatsApp"
 def _delivery_note(delivery, language):
     """English-only "(...)" aside for a save_now bill's real send outcome —
     used when no response-writer step runs to compose one (see
-    `_delivery_summary_note` for the roman_ur/ur equivalent)."""
+    `_delivery_summary_note` for the roman_ur/ur equivalent).
+
+    `delivery["sent"]` from `queue_document_send` means QUEUED, not
+    delivered — the actual WhatsApp attempt happens afterward in the
+    `document_send` job, which alone sets `DocumentDelivery.status` to
+    accepted/failed. Saying "was also sent" here claimed a completed
+    delivery this codebase can't actually know yet — the same overclaim
+    `_answer_delivery_status_question` exists to correct on a direct
+    question, just introduced here first. In-progress language only
+    ("SENDING." in prompt.py's contract instructions), same as every other
+    document send in this codebase.
+    """
     if delivery.get("sent"):
-        return " (It was also sent to the customer on WhatsApp.)"
+        return " (It's being sent to the customer on WhatsApp now.)"
     reason_text = _DELIVERY_REASON_TEXT.get(delivery.get("reason"), _DELIVERY_REASON_FALLBACK)
     return f" (The bill was saved, but not sent — {reason_text}.)"
 
@@ -911,11 +937,149 @@ def _delivery_summary_note(delivery):
     as the save_now_duplicate/save_now_failed notes above. Never left
     unsaid: the owner explicitly asked for this to be sent (that is the only
     way `delivery` is non-None at all — see `_SEND_INTENT_PATTERN`), so
-    silence here would read as "it worked" by omission."""
+    silence here would read as "it worked" by omission. See `_delivery_note`
+    for why "sent" is in-progress language, not a completed-delivery claim."""
     if delivery.get("sent"):
-        return "The bill was also sent to the customer on WhatsApp."
+        return "The bill is also being sent to the customer on WhatsApp now (not confirmed delivered yet)."
     reason_text = _DELIVERY_REASON_TEXT.get(delivery.get("reason"), _DELIVERY_REASON_FALLBACK)
     return f"The bill was saved, but it was NOT sent on WhatsApp — {reason_text}. Tell the owner plainly."
+
+
+#: The owner directly asking whether something already went out on WhatsApp
+#: ("WhatsApp m send hogya?", "kya bhej diya?", "sent?") — narrower than
+#: _WHATSAPP_MENTION_PATTERN alone (which would also match the owner simply
+#: asking to send something, not asking about a past send).
+_DELIVERY_STATUS_QUESTION_PATTERN = re.compile(
+    # WhatsApp mentioned explicitly, near a completion word.
+    r"whatsapp.{0,25}\b(hogya|ho gaya|hua|gaya|diya|kar diya|sent|delivered)\b"
+    r"|\b(hogya|ho gaya|hua|gaya|diya|kar diya|sent|delivered)\b.{0,25}whatsapp"
+    # No "WhatsApp" this time — a bare "send hogya?"/"bhej diya?" follow-up
+    # right after asking to send something reads as the same question in
+    # context, and "send"/"bhej" have no other meaning in this app's domain
+    # (there's nothing else a shopkeeper "sends"). Missing this made a real,
+    # frustrated repeat-question ("Send ho gaya? Jaldi batao...") fall
+    # through to the model's own vague deflection instead of the real
+    # status lookup below.
+    r"|\bsend\b.{0,15}\b(hogya|ho gaya|hua|gaya)\b|\b(hogya|ho gaya|hua|gaya)\b.{0,15}\bsend\b"
+    r"|\bbhej(a|o)?\b.{0,15}\b(diya|gaya|hogya|ho gaya|hua)\b"
+    r"|واٹس ایپ.{0,25}(ہوگیا|ہو گیا|ہوا|گیا|دیا)|(ہوگیا|ہو گیا|ہوا|گیا|دیا).{0,25}واٹس ایپ"
+    r"|بھیج.{0,15}(دیا|گیا|ہوگیا|ہو گیا)",
+    re.IGNORECASE,
+)
+
+#: Real outcome, by DocumentDelivery.status (+ a "not_connected"/"none" pair
+#: for when there's no row to check at all) — see
+#: `_answer_delivery_status_question`. Never says "delivered": Baileys only
+#: confirms WhatsApp *accepted* the message (see DocumentDelivery's own
+#: docstring on why "accepted" is this system's honest ceiling), so "sent"
+#: here means exactly that, not that the customer has read it.
+_DELIVERY_STATUS_TEMPLATES = {
+    "not_connected": {
+        "en": "WhatsApp isn't connected for this business — please reconnect it in Settings, then I can send bills again.",
+        "ur": "اس بزنس کے لیے واٹس ایپ منسلک نہیں ہے — براہ کرم سیٹنگز میں دوبارہ منسلک کریں، پھر میں بل بھیج سکوں گا۔",
+        "roman_ur": "Is business ke liye WhatsApp connect nahi hai — barah-e-karam Settings mein dobara connect karein, phir main bill bhej sakunga.",
+    },
+    "accepted": {
+        "en": "Yes — it was sent and WhatsApp accepted it.",
+        "ur": "جی ہاں — یہ بھیج دیا گیا اور واٹس ایپ نے قبول کر لیا۔",
+        "roman_ur": "Ji haan — yeh bhej diya gaya aur WhatsApp ne accept kar liya.",
+    },
+    "in_progress": {
+        "en": "It's still being sent — not confirmed yet, please check again in a moment.",
+        "ur": "یہ ابھی بھیجا جا رہا ہے — ابھی تک تصدیق نہیں ہوئی، تھوڑی دیر بعد دوبارہ چیک کریں۔",
+        "roman_ur": "Yeh abhi bhej raha hoon — abhi tak confirm nahi hua, thodi der baad dobara check karein.",
+    },
+    "failed": {
+        "en": "No, it was NOT sent — the WhatsApp delivery failed.",
+        "ur": "نہیں، یہ نہیں بھیجا گیا — واٹس ایپ ڈیلیوری ناکام ہو گئی۔",
+        "roman_ur": "Nahi, yeh nahi bheja gaya — WhatsApp delivery fail ho gayi.",
+    },
+    "none": {
+        "en": "No document has been sent yet for this business.",
+        "ur": "اس بزنس کے لیے ابھی تک کوئی دستاویز نہیں بھیجی گئی۔",
+        "roman_ur": "Is business ke liye abhi tak koi document nahi bheja gaya.",
+    },
+}
+
+#: `DocumentDelivery.error_code` -> a business-owner-safe reason, for the
+#: "failed" template above. `error_message` (the field these codes pair
+#: with on the row) is Python exception text meant for logs — e.g.
+#: "Document service is not reachable: HTTPConnectionPool(host='localhost',
+#: port=8001): ...WinError 10061..." — and must never reach the owner
+#: verbatim; codes are the stable, translatable signal.
+_DELIVERY_FAILURE_REASON_TEXT = {
+    "RENDER_UNAVAILABLE": {
+        "en": "the document couldn't be prepared — try again in a few minutes",
+        "ur": "دستاویز تیار نہیں ہو سکی — چند منٹ بعد دوبارہ کوشش کریں",
+        "roman_ur": "document taiyar nahi ho saka — chand minute baad dobara koshish karein",
+    },
+    "RENDER_FAILED": {
+        "en": "the document couldn't be prepared — try again in a few minutes",
+        "ur": "دستاویز تیار نہیں ہو سکی — چند منٹ بعد دوبارہ کوشش کریں",
+        "roman_ur": "document taiyar nahi ho saka — chand minute baad dobara koshish karein",
+    },
+    "GATEWAY_UNREACHABLE": {
+        "en": "WhatsApp couldn't be reached — try again in a few minutes",
+        "ur": "واٹس ایپ سے رابطہ نہیں ہو سکا — چند منٹ بعد دوبارہ کوشش کریں",
+        "roman_ur": "WhatsApp se rabta nahi ho saka — chand minute baad dobara koshish karein",
+    },
+    "SESSION_NOT_CONNECTED": {
+        "en": "WhatsApp isn't connected — please reconnect it in Settings",
+        "ur": "واٹس ایپ منسلک نہیں ہے — براہ کرم سیٹنگز میں دوبارہ منسلک کریں",
+        "roman_ur": "WhatsApp connect nahi hai — barah-e-karam Settings mein dobara connect karein",
+    },
+}
+_DELIVERY_FAILURE_REASON_FALLBACK = {
+    "en": "sending failed for a technical reason — please try again",
+    "ur": "تکنیکی وجہ سے بھیجنا ناکام ہوا — براہ کرم دوبارہ کوشش کریں",
+    "roman_ur": "technical wajah se bhejna fail hua — barah-e-karam dobara koshish karein",
+}
+
+
+def _answer_delivery_status_question(business, ai_message, owner_text, language):
+    """Server-side, ground-truth answer to a direct "did it get sent?"
+    question — real WhatsApp connection state plus the most recent
+    `DocumentDelivery`'s real `status`, never the model's own guess.
+
+    Replaces the whole reply, unconditionally, whenever the question is
+    asked — not just when the model got it wrong. A wrong status claim is
+    actively harmful here (the owner acts on it: assumes a customer already
+    has their bill, or never notices WhatsApp needs reconnecting), so this
+    is treated the same as every other money-adjacent fact in this codebase
+    that the model is never trusted to state on its own — checked and
+    reported, always, not hoped for.
+    """
+    if not _DELIVERY_STATUS_QUESTION_PATTERN.search(owner_text or ""):
+        return
+
+    if not business.gateway_session_id:
+        key = "not_connected"
+        detail = ""
+    else:
+        from apps.documents.models import DocumentDelivery
+
+        delivery = (
+            DocumentDelivery.objects.filter(business=business).order_by("-created_at").first()
+        )
+        if delivery is None:
+            key, detail = "none", ""
+        elif delivery.status == "accepted":
+            key, detail = "accepted", ""
+        elif delivery.status == "failed":
+            key = "failed"
+            reason_template = _DELIVERY_FAILURE_REASON_TEXT.get(
+                delivery.error_code, _DELIVERY_FAILURE_REASON_FALLBACK
+            )
+            detail = f" ({reason_template.get(language, reason_template['en'])})"
+        else:  # "pending" or "sending"
+            key, detail = "in_progress", ""
+
+    template = _DELIVERY_STATUS_TEMPLATES[key]
+    ai_message.text = template.get(language, template["en"]) + detail
+    ai_message.speech_text = (
+        to_urdu_script(template["roman_ur"]) or None if language == "roman_ur" else None
+    )
+    ai_message.save(update_fields=["text", "speech_text"])
 
 
 def _enforce_whatsapp_not_connected_notice(business, ai_message, owner_text, language):

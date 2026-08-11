@@ -433,6 +433,96 @@ class SaveNowSendIntentTests(TestCase):
         self.assertNotIn("WhatsApp", reply.text)
 
 
+class DeliveryStatusQuestionTests(TestCase):
+    """Real bug: a business with WhatsApp linked (gateway_session_id set)
+    was asked "WhatsApp m send hogya?" and the model fabricated an answer
+    ("send ho raha hai") it had no way to actually know. Fixed by
+    _answer_delivery_status_question giving the REAL DocumentDelivery
+    status (or the real "WhatsApp isn't connected" fact) instead of either
+    a guess or a deflecting "I can't see" — an owner asking this needs an
+    answer they can act on (reconnect WhatsApp, or know it went through)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="fd@x.com", email="fd@x.com", password="pw")
+        self.business = Business.objects.create(
+            owner=self.user, business_name="Test Shop", gateway_session_id="real-session-id",
+        )
+        self.customer = Customer.objects.create(
+            business=self.business, name="Ali", phone="923000000000", opening_balance=0, current_balance=0,
+        )
+        self.conversation = Conversation.objects.create(business=self.business)
+
+    def _ask(self, owner_text, model_reply_text="Haan ji WhatsApp par send ho raha hai"):
+        # Mocks both tiers (see select_model_tier) — this message's intent
+        # complexity decides which one actually gets called, and the test
+        # must not depend on that routing or hit the real Groq/Gemini APIs.
+        payload = json.dumps({"text": model_reply_text})
+        with mock.patch("apps.chat.services.call_gemma_planner", return_value=payload), \
+                mock.patch("apps.chat.services.call_groq", return_value=payload):
+            return services.generate_reply(
+                business=self.business, conversation=self.conversation, text=owner_text,
+            )
+
+    def test_not_connected_tells_the_owner_to_reconnect(self):
+        self.business.gateway_session_id = ""
+        self.business.save(update_fields=["gateway_session_id"])
+
+        reply = self._ask("WhatsApp m send hogya?")
+        self.assertIn("reconnect it in Settings", reply.text)
+
+    def test_accepted_delivery_says_it_was_sent(self):
+        from apps.documents.models import DocumentDelivery
+
+        DocumentDelivery.objects.create(
+            business=self.business, customer=self.customer, doc_type="invoice",
+            requested_format="image", to_phone=self.customer.phone, status="accepted",
+        )
+        reply = self._ask("WhatsApp m send hogya?", "Haan ji nahi pata mujhe.")
+        self.assertIn("Yes", reply.text)
+        self.assertIn("accepted", reply.text)
+
+    def test_failed_delivery_says_it_was_not_sent_with_a_friendly_reason(self):
+        """error_message is raw exception text (e.g. an HTTPConnectionPool
+        traceback) — must never reach the owner verbatim; error_code maps to
+        a translated, owner-safe reason instead (_DELIVERY_FAILURE_REASON_TEXT)."""
+        from apps.documents.models import DocumentDelivery
+
+        DocumentDelivery.objects.create(
+            business=self.business, customer=self.customer, doc_type="invoice",
+            requested_format="image", to_phone=self.customer.phone, status="failed",
+            error_code="RENDER_UNAVAILABLE",
+            error_message="Document service is not reachable: HTTPConnectionPool(host='localhost', port=8001)...",
+        )
+        reply = self._ask(
+            "WhatsApp m send hogya?", "Haan ji Kaif ka bill WhatsApp par send ho raha hai",
+        )
+        self.assertIn("NOT sent", reply.text)
+        self.assertIn("couldn't be prepared", reply.text)
+        self.assertNotIn("HTTPConnectionPool", reply.text)
+        self.assertNotIn("ho raha hai", reply.text)
+
+    def test_failed_delivery_with_an_unmapped_code_gets_a_generic_safe_reason(self):
+        from apps.documents.models import DocumentDelivery
+
+        DocumentDelivery.objects.create(
+            business=self.business, customer=self.customer, doc_type="invoice",
+            requested_format="image", to_phone=self.customer.phone, status="failed",
+            error_code="SOME_NEW_CODE", error_message="raw traceback text",
+        )
+        reply = self._ask("WhatsApp m send hogya?")
+        self.assertIn("NOT sent", reply.text)
+        self.assertIn("technical reason", reply.text)
+        self.assertNotIn("raw traceback text", reply.text)
+
+    def test_no_delivery_at_all_says_so(self):
+        reply = self._ask("WhatsApp m send hogya?")
+        self.assertIn("No document has been sent yet", reply.text)
+
+    def test_unrelated_questions_are_never_touched(self):
+        reply = self._ask("Aaj ki sales kitni hui?", "Aaj ki sales 5000 rupay hui hai.")
+        self.assertEqual(reply.text, "Aaj ki sales 5000 rupay hui hai.")
+
+
 class DraftBillEditPersistenceTests(APITestCase):
     """Confirming records the sale from the draft stored on the server, and the
     app had no way to write the owner's edits back — so correcting a total, its
