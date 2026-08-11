@@ -310,7 +310,19 @@ def _find_recent_matching_sale(business, customer, items, payment_received):
     return None
 
 
-def record_drafted_bill(business, message):
+#: Narrower than prompt.DOCUMENT_HINT_PATTERN (which also matches plain
+#: accounting words like "ledger"/"hisaab"/"poora") — this one gates an
+#: actual WhatsApp send attempt, so it must only fire on words that
+#: genuinely mean "send this", never on a message that merely mentions
+#: accounts/statements in passing.
+_SEND_INTENT_PATTERN = re.compile(
+    r"\bsend\b|\bshare\b|\bwhatsapp\b|\bbhej\b|\bbhejo\b|\bbhejna\b|\bbhej do\b"
+    r"|بھیج|بھیجو|واٹس ایپ|واٹساپ",
+    re.IGNORECASE,
+)
+
+
+def record_drafted_bill(business, message, *, also_send=False):
     """Records `message.draft_bill` on the ledger immediately, skipping Confirm.
 
     Only reached when the owner asked for it in words ("record mein save kar
@@ -323,16 +335,25 @@ def record_drafted_bill(business, message):
     same requirement that a real customer is linked, and the same audit row
     recording that the AI created this entry.
 
-    Returns "saved" only if money was actually written, "duplicate" if an
-    identical sale for this customer was already recorded moments ago (see
-    `_find_recent_matching_sale` — this is the save_now path's equivalent of
-    the owner's own "is this a repeat order or the same one already saved?"
-    question, done automatically since save_now never shows a review step),
-    or "failed" for a validation/DB error.
+    Returns `(status, delivery)`. `status` is "saved" only if money was
+    actually written, "duplicate" if an identical sale for this customer was
+    already recorded moments ago (see `_find_recent_matching_sale` — this is
+    the save_now path's equivalent of the owner's own "is this a repeat order
+    or the same one already saved?" question, done automatically since
+    save_now never shows a review step), or "failed" for a validation/DB
+    error. `delivery` is always None unless `also_send` is true AND the sale
+    was actually saved.
 
-    Deliberately does NOT send anything on WhatsApp. The owner asked to save,
-    and delivery is a separate decision — see `queue_invoice_send`'s caller.
+    `also_send`: the owner saying "save karo" is not the same as "save karo
+    aur bhej do" — this only attempts a WhatsApp send (via the same
+    `queue_invoice_send` the Confirm button uses, so the same NOT_CONNECTED/
+    NO_PHONE/NOT_ON_PLAN/QUOTA_EXCEEDED outcomes apply) when the owner's own
+    words asked for sending too (see `_SEND_INTENT_PATTERN`, checked by the
+    caller). Silently never attempting a send the owner explicitly asked for
+    — and then saying nothing about it — is exactly the confusing "did it
+    send or not?" gap this parameter closes.
     """
+    from apps.documents import services as document_services
     from apps.sales import services as sales_services
     from apps.sales.business_date import to_entry_timestamp
 
@@ -344,20 +365,20 @@ def record_drafted_bill(business, message):
         # Nothing to attach the money to. The draft stays unconfirmed so the
         # owner can pick a customer and confirm by hand.
         logger.info("save_now skipped: draft on message %s has no matched customer", message.id)
-        return "failed"
+        return "failed", None
 
     try:
         items, payment_received, business_date = build_sale_from_draft(draft)
     except ValueError as exc:
         logger.warning("save_now rejected on message %s: %s", message.id, exc)
-        return "failed"
+        return "failed", None
 
     if _find_recent_matching_sale(business, customer, items, payment_received) is not None:
         logger.info(
             "save_now skipped: an identical sale for customer %s was recorded in the last %s minutes",
             customer.id, DUPLICATE_SALE_WINDOW_MINUTES,
         )
-        return "duplicate"
+        return "duplicate", None
 
     try:
         sale_entry, _payment = sales_services.record_sale(
@@ -371,13 +392,15 @@ def record_drafted_bill(business, message):
         )
     except Exception:  # noqa: BLE001 - a failed save must leave the draft confirmable by hand
         logger.exception("save_now failed to record the sale for message %s", message.id)
-        return "failed"
+        return "failed", None
 
     sales_services.log_ai_created_sale(entry=sale_entry, source_message_id=message.id)
     ChatMessage.objects.filter(pk=message.pk).update(draft_confirmed=True)
     message.draft_confirmed = True
     logger.info("save_now recorded sale %s from message %s", sale_entry.id, message.id)
-    return "saved"
+
+    delivery = document_services.queue_invoice_send(business, sale_entry, customer) if also_send else None
+    return "saved", delivery
 
 
 def to_urdu_script(text):
@@ -684,9 +707,14 @@ def generate_reply(*, business, conversation, text, language=None):
     # exists so the audit row can point at the message that caused the entry.
     save_now_failed = False
     save_now_duplicate = False
+    delivery = None
     draft = reply_data.get("draft_bill") or {}
     if draft.get("save_now") and not ai_failed:
-        save_result = record_drafted_bill(business, ai_message)
+        # "save karo" alone must never send anything — only attempt a
+        # WhatsApp send when the owner's own words also asked for it (see
+        # _SEND_INTENT_PATTERN's docstring on record_drafted_bill).
+        also_send = bool(_SEND_INTENT_PATTERN.search(text or ""))
+        save_result, delivery = record_drafted_bill(business, ai_message, also_send=also_send)
         if save_result != "saved":
             save_now_failed = save_result == "failed"
             save_now_duplicate = save_result == "duplicate"
@@ -709,6 +737,13 @@ def generate_reply(*, business, conversation, text, language=None):
             # summary instead (see below) so the response writer composes it
             # in the owner's language, rather than appending an English
             # sentence to a reply that hasn't been written yet.
+        elif delivery is not None and language not in _WRITER_LANGUAGES:
+            # Saved successfully AND the owner asked for it to be sent —
+            # English path: say plainly whether it actually went out, same
+            # "never let the owner believe something happened that didn't"
+            # reasoning as the failure/duplicate notes above.
+            ai_message.text = f"{ai_message.text}\n\n{_delivery_note(delivery, 'en')}"
+            ai_message.save(update_fields=["text"])
 
     agent_overwrote_text = False
     if not ai_failed:
@@ -733,6 +768,8 @@ def generate_reply(*, business, conversation, text, language=None):
                 "The bill could NOT be recorded automatically due to an error — "
                 "ask the owner to check the draft and confirm/save it manually."
             )
+        elif delivery is not None:
+            summary = (summary + " " if summary else "") + _delivery_summary_note(delivery)
         final_text, final_speech = _write_final_reply(text, summary, language)
         ai_message.text = final_text
         ai_message.speech_text = final_speech or None
@@ -840,6 +877,45 @@ _NOT_CONNECTED_NOTICES = {
     "ur": " (اس بزنس کے لیے واٹس ایپ منسلک نہیں ہے — کچھ بھی بھیجنے سے پہلے سیٹنگز میں جا کر منسلک کریں۔)",
     "roman_ur": " (Is business ke liye WhatsApp connect nahi hai — kuch bhi bhejne se pehle Settings mein ja kar connect karein.)",
 }
+
+#: What actually happened to a save_now'd bill's WhatsApp send, by
+#: `queue_invoice_send`'s `reason` code (apps.documents.services.
+#: queue_document_send) — English only. For roman_ur/ur this feeds
+#: `_delivery_summary_note` -> `_build_execution_summary` -> the
+#: response-writer step, same as every other execution fact; for a
+#: non-writer language (English) `_delivery_note` below wraps it in the
+#: same "(...)" aside style as `_NOT_CONNECTED_NOTICES`.
+_DELIVERY_REASON_TEXT = {
+    "NOT_CONNECTED": "WhatsApp isn't connected for this business yet — connect it in Settings before anything can be sent",
+    "NO_PHONE": "this customer has no phone number on file, so nothing could be sent",
+    "NOT_ON_PLAN": "sending on WhatsApp isn't included in the current plan",
+    "QUOTA_EXCEEDED": "this month's WhatsApp sending limit has been reached",
+}
+_DELIVERY_REASON_FALLBACK = "the bill could not be sent on WhatsApp"
+
+
+def _delivery_note(delivery, language):
+    """English-only "(...)" aside for a save_now bill's real send outcome —
+    used when no response-writer step runs to compose one (see
+    `_delivery_summary_note` for the roman_ur/ur equivalent)."""
+    if delivery.get("sent"):
+        return " (It was also sent to the customer on WhatsApp.)"
+    reason_text = _DELIVERY_REASON_TEXT.get(delivery.get("reason"), _DELIVERY_REASON_FALLBACK)
+    return f" (The bill was saved, but not sent — {reason_text}.)"
+
+
+def _delivery_summary_note(delivery):
+    """English execution-summary fact for a save_now bill's real send
+    outcome, folded into `_build_execution_summary`'s output so the
+    response-writer composes it in the owner's own language — same pattern
+    as the save_now_duplicate/save_now_failed notes above. Never left
+    unsaid: the owner explicitly asked for this to be sent (that is the only
+    way `delivery` is non-None at all — see `_SEND_INTENT_PATTERN`), so
+    silence here would read as "it worked" by omission."""
+    if delivery.get("sent"):
+        return "The bill was also sent to the customer on WhatsApp."
+    reason_text = _DELIVERY_REASON_TEXT.get(delivery.get("reason"), _DELIVERY_REASON_FALLBACK)
+    return f"The bill was saved, but it was NOT sent on WhatsApp — {reason_text}. Tell the owner plainly."
 
 
 def _enforce_whatsapp_not_connected_notice(business, ai_message, owner_text, language):

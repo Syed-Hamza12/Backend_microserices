@@ -305,15 +305,15 @@ class SaveNowTests(TestCase):
             "items": [{"item_name": "Rice", "quantity": 2, "rate": 500}],
         }
 
-    def _attempt(self, draft):
+    def _attempt(self, draft, also_send=False):
         message = ChatMessage.objects.create(
             conversation=self.conversation, sender="ai", text="x", draft_bill=draft
         )
-        saved = services.record_drafted_bill(self.business, message)
-        return saved, message
+        saved, delivery = services.record_drafted_bill(self.business, message, also_send=also_send)
+        return saved, message, delivery
 
     def test_an_explicit_save_records_the_sale_without_a_confirm_tap(self):
-        saved, message = self._attempt(self.valid)
+        saved, message, _delivery = self._attempt(self.valid)
 
         self.assertEqual(saved, "saved")
         entry = ActivityEntry.objects.get(business=self.business, type="sale")
@@ -332,31 +332,105 @@ class SaveNowTests(TestCase):
             ("another business's customer", {**self.valid, "customer_id": "999999"}),
         ]:
             with self.subTest(case=label):
-                saved, message = self._attempt(draft)
+                saved, message, _delivery = self._attempt(draft)
                 self.assertEqual(saved, "failed")
                 self.assertFalse(ActivityEntry.objects.filter(business=self.business).exists())
                 # Left unconfirmed so the owner can still fix it and confirm.
                 self.assertFalse(message.draft_confirmed)
 
     def test_an_identical_sale_saved_moments_ago_is_not_recorded_again(self):
-        first_saved, _ = self._attempt(self.valid)
+        first_saved, _msg, _delivery = self._attempt(self.valid)
         self.assertEqual(first_saved, "saved")
 
-        second_saved, second_message = self._attempt(self.valid)
+        second_saved, second_message, _delivery = self._attempt(self.valid)
 
         self.assertEqual(second_saved, "duplicate")
         self.assertEqual(ActivityEntry.objects.filter(business=self.business, type="sale").count(), 1)
         self.assertFalse(second_message.draft_confirmed)
 
     def test_a_second_order_with_different_items_is_recorded_normally(self):
-        first_saved, _ = self._attempt(self.valid)
+        first_saved, _msg, _delivery = self._attempt(self.valid)
         self.assertEqual(first_saved, "saved")
 
         different = {**self.valid, "items": [{"item_name": "Rice", "quantity": 5, "rate": 500}], "total_amount": 2500.0}
-        second_saved, _ = self._attempt(different)
+        second_saved, _msg, _delivery = self._attempt(different)
 
         self.assertEqual(second_saved, "saved")
         self.assertEqual(ActivityEntry.objects.filter(business=self.business, type="sale").count(), 2)
+
+    def test_also_send_is_never_attempted_unless_requested(self):
+        """"save karo" alone must never trigger a WhatsApp send — only
+        "save karo aur bhej do" does (see record_drafted_bill's also_send
+        docstring)."""
+        saved, _msg, delivery = self._attempt(self.valid, also_send=False)
+        self.assertEqual(saved, "saved")
+        self.assertIsNone(delivery)
+
+    def test_also_send_reports_the_real_not_connected_reason(self):
+        """The bug this closes: a save_now'd bill the owner also asked to
+        send used to save silently and never say whether it was actually
+        sent — see generate_reply's _delivery_note/_delivery_summary_note."""
+        saved, _msg, delivery = self._attempt(self.valid, also_send=True)
+        self.assertEqual(saved, "saved")
+        self.assertEqual(delivery, {"sent": False, "reason": "NOT_CONNECTED"})
+
+    def test_also_send_reason_changes_once_whatsapp_is_connected(self):
+        """Connecting WhatsApp changes the real failure reason (this business
+        has no paid plan either, so it still isn't sent) — proves the
+        outcome is a genuine `queue_invoice_send` call, not a hardcoded
+        NOT_CONNECTED."""
+        self.business.gateway_session_id = "test-session"
+        self.business.save(update_fields=["gateway_session_id"])
+
+        saved, _msg, delivery = self._attempt(self.valid, also_send=True)
+        self.assertEqual(saved, "saved")
+        self.assertNotEqual(delivery["reason"], "NOT_CONNECTED")
+
+
+class SaveNowSendIntentTests(TestCase):
+    """generate_reply's decision to attempt a WhatsApp send at all — the
+    part of the fix that makes save_now's reply text actually match what
+    happened, instead of staying silent about a send the owner asked for
+    (or attempting one they never asked for)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="si@x.com", email="si@x.com", password="pw")
+        self.business = Business.objects.create(owner=self.user, business_name="Test Shop")
+        self.customer = Customer.objects.create(
+            business=self.business, name="Ali", phone="923000000000", opening_balance=0, current_balance=0,
+        )
+        self.conversation = Conversation.objects.create(business=self.business)
+
+    def _reply_payload(self, text):
+        return {
+            "text": text,
+            "draft_bill": {
+                "customer_id": str(self.customer.id),
+                "previous_balance": 0.0,
+                "total_amount": 1000.0,
+                "payment_received": 0.0,
+                "items": [{"item_name": "Rice", "quantity": 2, "rate": 500}],
+                "save_now": True,
+            },
+        }
+
+    def test_send_wording_triggers_a_delivery_attempt_and_says_it_failed(self):
+        payload = self._reply_payload("Haan save kar do aur WhatsApp pe bhej do")
+        with mock.patch("apps.chat.services.call_gemma_planner", return_value=json.dumps(payload)):
+            reply = services.generate_reply(
+                business=self.business, conversation=self.conversation,
+                text="Haan save kar do aur WhatsApp pe bhej do",
+            )
+        self.assertIn("WhatsApp", reply.text)
+        self.assertIn("connect", reply.text.lower())
+
+    def test_plain_save_wording_never_mentions_whatsapp(self):
+        payload = self._reply_payload("Bill save kar do")
+        with mock.patch("apps.chat.services.call_gemma_planner", return_value=json.dumps(payload)):
+            reply = services.generate_reply(
+                business=self.business, conversation=self.conversation, text="Bill save kar do",
+            )
+        self.assertNotIn("WhatsApp", reply.text)
 
 
 class DraftBillEditPersistenceTests(APITestCase):
