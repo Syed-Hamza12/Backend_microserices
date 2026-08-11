@@ -20,6 +20,10 @@ def _handler_for(job_type):
         from apps.image_info_extractor.services import handle_image_extract_job
 
         return handle_image_extract_job
+    if job_type == "voice_transcribe":
+        from apps.voice_transcriber.services import handle_voice_transcribe_job
+
+        return handle_voice_transcribe_job
     raise ValueError(f"No worker handler registered for job type: {job_type}")
 
 

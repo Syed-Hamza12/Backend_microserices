@@ -10,6 +10,7 @@ class JobTask(models.Model):
         # generated documents are transient now.
         ("document_send", "Document Send"),
         ("image_extract", "Image Extract"),
+        ("voice_transcribe", "Voice Transcribe"),
     ]
     STATUS_CHOICES = [
         ("queued", "Queued"),

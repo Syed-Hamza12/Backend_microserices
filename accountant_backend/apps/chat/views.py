@@ -6,17 +6,20 @@ from django.db.models import Count, F, Max
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.models import Business
+from apps.accounts.uploads import save_validated_audio
 from apps.billing.permissions import HasFeature
-from apps.billing.services import enforce_feature_gate
+from apps.billing.services import enforce_feature_gate, refund_feature_usage
 from apps.customers.models import Customer
 from apps.customers.phone import normalize_phone
 from apps.documents import services as document_services
 from apps.image_info_extractor import matching
+from apps.jobs.dispatch import enqueue
 from apps.sales import services as sales_services
 from apps.sales.models import ActivityEntry
 from apps.sales.business_date import BusinessDateError, resolve as resolve_business_date, to_entry_timestamp
@@ -323,6 +326,92 @@ class SendChatMessageView(APIView):
                     "reply": ChatMessageSerializer(ai_message).data,
                 },
             }
+        )
+
+
+class UploadChatVoiceView(APIView):
+    """Uploads a recorded voice note, transcribes it, and runs it through the
+    same chat pipeline typed text uses — the WhatsApp-style recording flow
+    that replaced on-device speech-to-text (see apps.voice_transcriber).
+
+    Mirrors apps.image_info_extractor.views.UploadChatImageView: the upload
+    itself is cheap and synchronous, transcription + the chat reply happen
+    async in the jobs worker (apps.voice_transcriber.services.
+    handle_voice_transcribe_job), and the app polls /jobs/<id>/ for the
+    result, same as it already does for a photographed bill.
+
+    Gated on `ai_chat`, not a separate feature: a voice note IS a chat
+    message, just captured by microphone instead of keyboard, and this is
+    the only feature slot the transcription + reply pair below ever claims.
+    """
+
+    permission_classes = [IsAuthenticated, HasFeature]
+    required_feature = "ai_chat"
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        try:
+            business = request.user.business
+        except Business.DoesNotExist:
+            return Response(
+                {"success": False, "error": {"code": "NO_BUSINESS", "message": "No business created yet."}},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        audio = request.FILES.get("audio")
+        if not audio:
+            return Response(
+                {"success": False, "error": {"code": "VALIDATION_ERROR", "message": "audio file is required."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        conversation_id = request.data.get("conversationId")
+        if conversation_id:
+            try:
+                conversation = Conversation.objects.get(business=business, pk=conversation_id)
+            except Conversation.DoesNotExist:
+                return Response(
+                    {"success": False, "error": {"code": "NOT_FOUND", "message": "Conversation not found."}},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+        else:
+            conversation = Conversation.objects.create(business=business)
+
+        # Claimed here, up front, before the (paid) Gemini transcription call
+        # — same rule as every other AI call in this codebase. The worker
+        # refunds this slot if transcription fails or hears no speech (see
+        # apps.voice_transcriber.services).
+        enforce_feature_gate(business, "ai_chat")
+
+        try:
+            audio_url, _mime_type = save_validated_audio(audio, subdirectory="voice_notes")
+        except Exception:
+            refund_feature_usage(business, "ai_chat")
+            raise
+
+        # Created now, with no text yet, so the recording appears in chat
+        # immediately — the transcript fills in once the worker finishes,
+        # same "message exists before its content is known" pattern
+        # UploadChatImageView uses for a photographed bill.
+        message = ChatMessage.objects.create(conversation=conversation, sender="owner", audio_url=audio_url)
+
+        job = enqueue(
+            business=business,
+            type="voice_transcribe",
+            payload={"conversation_id": conversation.id, "message_id": message.id},
+        )
+
+        return Response(
+            {
+                "success": True,
+                "data": {
+                    "job_id": job.id,
+                    "conversationId": conversation.id,
+                    "messageId": message.id,
+                    "message": ChatMessageSerializer(message).data,
+                },
+            },
+            status=status.HTTP_202_ACCEPTED,
         )
 
 

@@ -4,6 +4,10 @@ from . import views
 
 urlpatterns = [
     path("chat/message/", views.SendChatMessageView.as_view(), name="send-chat-message"),
+    # Records a voice note, transcribes it (Roman Urdu-aware), and runs it
+    # through the same reply pipeline as typed text — see
+    # apps.voice_transcriber and UploadChatVoiceView's docstring.
+    path("chat/voice/", views.UploadChatVoiceView.as_view(), name="upload-chat-voice"),
     # Urdu script -> Roman Urdu for dictated input (the ur-PK recogniser emits
     # no other script). Called by the app in Roman Urdu mode only.
     path("chat/transliterate/", views.TransliterateView.as_view(), name="chat-transliterate"),

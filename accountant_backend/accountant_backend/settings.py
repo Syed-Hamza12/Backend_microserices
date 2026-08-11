@@ -257,6 +257,20 @@ GOOGLE_FAST_FALLBACK_MODELS = [
     if m.strip()
 ]
 
+# Voice-note transcription (apps.voice_transcriber): a recorded chat message is
+# uploaded as audio and transcribed here before it ever reaches the chat
+# planner — see apps.voice_transcriber.google_client. Kept on the same
+# flash-tier constraint as GEMINI_TEXT_MODEL above (this key's Pro models 429),
+# and deliberately its own setting rather than reusing GEMINI_TEXT_MODEL: audio
+# transcription cost/accuracy tuning must not silently move the transliteration
+# path too.
+GEMINI_AUDIO_MODEL = os.environ.get("GEMINI_AUDIO_MODEL", "gemini-3.1-flash-lite")
+GEMINI_AUDIO_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get("GEMINI_AUDIO_FALLBACK_MODELS", "gemini-flash-latest").split(",")
+    if m.strip()
+]
+
 # Runs the job worker as a thread inside the web process instead of as a
 # separate `manage.py runworker`. For free hosting tiers that have no
 # always-on background process (Render free, PythonAnywhere free) — without it,

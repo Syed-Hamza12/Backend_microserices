@@ -1172,6 +1172,14 @@ class DomainKnowledgeTests(TestCase):
         )
         self.assertIn("ALWAYS override the industry reference knowledge above", prompt_text)
 
+    def test_prompt_instructs_model_to_correct_mismatched_customer_names(self):
+        """A misheard/mistyped customer name (voice transcription: "Kaaif" ->
+        "Kashif") must not be echoed back once matched to a real customer —
+        see docstring on the CUSTOMER NAME SPELLING block in prompt.py."""
+        prompt_text = build_system_prompt(self.business, "hello")
+        self.assertIn("CUSTOMER NAME SPELLING", prompt_text)
+        self.assertIn("ALWAYS write that customer's name back in \"text\" using their REAL listed", prompt_text)
+
     def test_no_domain_or_instructions_sections_when_unset(self):
         prompt_text = build_system_prompt(self.business, "hello")
         self.assertEqual(build_domain_knowledge_context(self.business), "")

@@ -52,6 +52,10 @@ class ChatMessage(models.Model):
     text = models.TextField(null=True, blank=True)
     speech_text = models.TextField(null=True, blank=True)
     image_url = models.URLField(null=True, blank=True)
+    # A recorded voice note's stored file — kept for WhatsApp-style replay only.
+    # The transcript that lands in `text`/`speech_text` (apps.voice_transcriber)
+    # is what the chat planner ever sees; this file is never re-sent to a model.
+    audio_url = models.URLField(null=True, blank=True)
     draft_bill = models.JSONField(null=True, blank=True)
     draft_confirmed = models.BooleanField(default=False)
     document_ready = models.JSONField(null=True, blank=True)

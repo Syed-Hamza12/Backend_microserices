@@ -205,6 +205,7 @@ class ChatMessageSerializer(serializers.ModelSerializer):
             "text",
             "speech_text",
             "image_url",
+            "audio_url",
             "draft_bill",
             "draft_confirmed",
             "document_ready",
