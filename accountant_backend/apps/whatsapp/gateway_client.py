@@ -1,8 +1,11 @@
+import logging
 from datetime import datetime, timedelta, timezone
 
 import jwt
 import requests
 from django.conf import settings
+
+logger = logging.getLogger(__name__)
 
 GATEWAY_AUDIENCE = "whatsapp-gateway"
 SESSION_CREATE_SCOPE = "session:create"
@@ -57,15 +60,32 @@ def _request(method, path, *, session_id=None, scope=None, timeout=DEFAULT_TIMEO
         response = requests.request(method, url, headers=headers, timeout=timeout, **kwargs)
     except requests.RequestException as exc:
         # The Gateway being down/unreachable must surface as a clean, typed
-        # failure the views already know how to render — not a raw 500.
-        raise GatewayError(503, "GATEWAY_UNREACHABLE", f"WhatsApp gateway is not reachable: {exc}") from exc
+        # failure the views already know how to render — not a raw 500. The
+        # raw exception (hostnames, ports, connection internals) is logged
+        # server-side only; GatewayError.message is what ends up stored on
+        # DocumentDelivery.error_message and, from there, shown to the
+        # business owner (and formerly, verbatim) — it must never carry
+        # anything but a plain, safe sentence a shopkeeper can read.
+        logger.warning("WhatsApp gateway request failed: %s %s -> %s", method, path, exc)
+        raise GatewayError(503, "GATEWAY_UNREACHABLE", "WhatsApp gateway is not reachable.") from exc
 
     if response.status_code >= 400:
         try:
             error = response.json()["error"]
             code, message = error["code"], error["message"]
         except Exception:
-            code, message = "GATEWAY_ERROR", response.text
+            # The Gateway's error response wasn't the JSON shape expected —
+            # e.g. an HTML error page from an unrelated service at a
+            # misconfigured URL, or a proxy/firewall block page. That raw
+            # body can contain anything (a real incident: it once carried
+            # this business's own session id and a customer's phone number
+            # in plaintext) and must never be stored or shown — only logged
+            # for debugging.
+            logger.warning(
+                "WhatsApp gateway returned a non-JSON error (status=%s): %.500s",
+                response.status_code, response.text,
+            )
+            code, message = "GATEWAY_ERROR", "WhatsApp gateway returned an unexpected error."
         raise GatewayError(response.status_code, code, message)
     return response
 

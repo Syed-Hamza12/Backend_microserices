@@ -1,3 +1,4 @@
+import logging
 from decimal import ROUND_HALF_UP, Decimal
 
 import requests
@@ -9,6 +10,8 @@ from django.utils.dateparse import parse_date
 from apps.customers.models import Customer
 from apps.sales.business_date import BusinessDateError, resolve as resolve_business_date
 from apps.sales.models import ActivityEntry
+
+logger = logging.getLogger(__name__)
 
 ALL_DOC_TYPES = {"invoice", "receipt", "statement", "report"}
 
@@ -374,7 +377,12 @@ def render_document(*, doc_type, output_format, business_id, payload):
             timeout=60,
         )
     except requests.RequestException as exc:
-        raise DocumentError("RENDER_UNAVAILABLE", f"Document service is not reachable: {exc}")
+        # DocumentError.message ends up stored on DocumentDelivery.error_message
+        # and, from there, shown to the business owner (chat status answers,
+        # the Send Document sheet) — it must never carry hostnames/ports/
+        # connection internals from the raw exception. Logged server-side only.
+        logger.warning("FastAPI document render service unreachable: %s", exc)
+        raise DocumentError("RENDER_UNAVAILABLE", "Document service is not reachable.")
 
     if response.status_code >= 400:
         try:

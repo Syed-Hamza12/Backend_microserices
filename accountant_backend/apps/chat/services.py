@@ -11,8 +11,7 @@ from apps.image_info_extractor import matching
 from apps.sales.business_date import BusinessDateError, business_today, resolve as resolve_business_date
 
 from . import prompt
-from .google_client import call_gemma_planner
-from .groq_client import call_groq, call_groq_text
+from .google_client import call_gemini_reasoning, call_gemini_text, call_gemma_planner
 from .models import ChatMessage
 from .serializers import AiReplySerializer
 
@@ -141,10 +140,10 @@ def transliterate_to_roman_urdu(text):
         return text
 
     try:
-        # Groq, not Gemini — this is ordinary per-message chat traffic, not
-        # OCR, and Gemini's free-tier quota (20 requests/day) can't carry it.
-        # See call_groq_text's docstring.
-        converted = call_groq_text(
+        # The reasoning/quality tier's own key pool (call_gemini_text), not
+        # OCR's — see call_gemini_reasoning's docstring for why chat traffic
+        # needed its own pool separate from OCR's.
+        converted = call_gemini_text(
             prompt.TRANSLITERATION_INSTRUCTIONS, text[:MAX_TRANSLITERATE_CHARS]
         )
     except Exception as exc:  # noqa: BLE001 - never lose the owner's words to this
@@ -415,17 +414,19 @@ def to_urdu_script(text):
         return text
 
     try:
-        # Groq, not Gemini — moved off Gemini for quota reasons (see
-        # call_groq_text's docstring), even though this is the one call in
+        # Back on Gemini (call_gemini_text) — this is in fact the one call in
         # this module Gemini was originally added FOR: Llama has a documented
         # history of writing Urdu script badly enough to be unintelligible
         # when spoken ("Mujhe samajh nahi aya" came back as "موجه سمجه نهين
-        # آدا" — Arabic ه for Urdu ھ/ہ, mangled words). `has_urdu_script`
-        # below cannot catch that specific failure mode: the mangled output
-        # is still technically in the Urdu/Arabic Unicode block, so it looks
-        # "valid" to that check. If TTS starts sounding like noise again for
-        # Roman Urdu owners, this is the first place to look.
-        converted = call_groq_text(
+        # آدا" — Arabic ه for Urdu ھ/ہ, mangled words). It was moved to Groq
+        # for a time purely over Gemini's free-tier quota; that reasoning no
+        # longer applies now that chat has its own dedicated key pool (see
+        # call_gemini_reasoning's docstring). `has_urdu_script` below cannot
+        # catch the mangled-script failure mode on its own: the mangled
+        # output is still technically in the Urdu/Arabic Unicode block, so
+        # it looks "valid" to that check. If TTS starts sounding like noise
+        # again for Roman Urdu owners, this is the first place to look.
+        converted = call_gemini_text(
             prompt.URDU_SCRIPT_INSTRUCTIONS, text[:MAX_TRANSLITERATE_CHARS]
         )
     except Exception as exc:  # noqa: BLE001 - speech is optional, the reply is not
@@ -443,49 +444,54 @@ def to_urdu_script(text):
 
 
 def select_model_tier(message_text, language):
-    """Which model handles the JSON/intent step — two Groq tiers. Purely
-    intent-complexity-driven now: `needs_reasoning` recognises bill/edit/
-    document intent in English, Urdu and Roman Urdu alike, and that alone
-    decides fast (8B) vs reasoning (70B) for THIS step.
+    """Which model handles the JSON/intent step — two tiers, both Gemini now
+    (see `_call_model`). Purely intent-complexity-driven: `needs_reasoning`
+    recognises bill/edit/document intent in English, Urdu and Roman Urdu
+    alike, and that alone decides fast (Gemma) vs reasoning
+    (Gemini's quality model) for THIS step.
 
     Language used to force the reasoning tier by itself for ur/roman_ur,
-    unconditionally — because 8B cannot WRITE Urdu acceptably (it once
-    returned "پاپ کا جو 1 ڑڑ خَد 20 مۉّد" to a real owner, which is not
-    words). That write-quality problem is real, but it is a problem with
-    PROSE, not with understanding the message or filling out the JSON
-    contract — so it is now solved downstream instead: for `ur`/`roman_ur`,
-    the JSON step's own "text" is discarded entirely (never shown to the
-    owner, see `generate_reply`), and `_write_final_reply` COMPOSES a fresh
-    reply on 70B from the owner's message plus a plain execution summary —
-    never by forcing the whole intent/planning step onto the expensive
-    model, and never by rewriting the JSON step's own sentence. See
-    AGENTS.md / AGENT_DATA_FLOW.md's model-routing sections for the full
-    before/after picture and the token-cost reasoning behind this.
+    unconditionally — because the fast-tier model cannot WRITE Urdu
+    acceptably (it once returned "پاپ کا جو 1 ڑڑ خَد 20 مۉّد" to a real
+    owner, which is not words). That write-quality problem is real, but it
+    is a problem with PROSE, not with understanding the message or filling
+    out the JSON contract — so it is now solved downstream instead: for
+    `ur`/`roman_ur`, the JSON step's own "text" is discarded entirely
+    (never shown to the owner, see `generate_reply`), and
+    `_write_final_reply` COMPOSES a fresh reply on the reasoning-tier model
+    from the owner's message plus a plain execution summary — never by
+    forcing the whole intent/planning step onto the expensive model, and
+    never by rewriting the JSON step's own sentence. See AGENTS.md /
+    AGENT_DATA_FLOW.md's model-routing sections for the full before/after
+    picture and the token-cost reasoning behind this.
 
-    Gemini is not used for chat replies at all — its free-tier quota (20
-    requests/day) can't carry ordinary chat volume; it is reserved for
-    `apps.image_info_extractor.gemini_client.extract_receipt_data` (OCR)
-    only.
+    Chat's two tiers each have their own Gemini key pool
+    (`settings.FAST_GEMINI_API_KEYS` / `QUALITY_GEMINI_API_KEYS`), separate
+    from OCR's (`GEMINI_API_KEYS`,
+    `apps.image_info_extractor.gemini_client.extract_receipt_data`) — three
+    features that would otherwise compete for one shared free-tier daily
+    quota.
     """
     return "reasoning" if prompt.needs_reasoning(message_text) else "fast"
 
 
 def _call_model(tier, messages):
-    """The single dispatch point between the two chat-turn tiers. "fast" now
-    means Gemma via Google (`apps.chat.google_client`), not Groq's 8B —
-    `select_model_tier`'s routing rule itself is unchanged, only what "fast"
-    resolves to. "reasoning" is untouched: still Groq's 70B, same call as
-    before this swap."""
+    """The single dispatch point between the two chat-turn tiers. Both are
+    Gemini now: "fast" is Gemma (`call_gemma_planner`), "reasoning" is
+    Gemini's quality model (`call_gemini_reasoning`, replacing Groq's
+    llama-3.3-70b-versatile) — `select_model_tier`'s routing rule itself is
+    unchanged, only what each tier resolves to. Each keeps its own key pool
+    (see settings.FAST_GEMINI_API_KEYS / QUALITY_GEMINI_API_KEYS)."""
     if tier == "fast":
         return call_gemma_planner(messages=messages)
-    return call_groq(messages=messages, reasoning=True)
+    return call_gemini_reasoning(messages=messages)
 
 
 #: Languages whose final reply text/speech_text are COMPOSED FRESH by the
-#: 70B "response writer" step, from execution facts — never shown the JSON
-#: step's own prose. English isn't here: 8B's English prose is fine, so
+#: reasoning-tier "response writer" step, from execution facts — never shown the JSON
+#: step's own prose. English isn't here: the fast tier's English prose is fine, so
 #: needs_reasoning alone already routes English's genuinely complex turns to
-#: 70B for the whole call — no separate writer pass is needed for it.
+#: the reasoning tier for the whole call — no separate writer pass is needed for it.
 _WRITER_LANGUAGES = ("ur", "roman_ur")
 
 
@@ -495,7 +501,7 @@ def _build_execution_summary(reply_data):
     besides the owner's own message. Deliberately never the JSON step's own
     "text" unless nothing else describes the turn at all (a plain question/
     answer with no draft) — see `generate_reply` for why: that field is
-    8B/70B's own prose, and for `ur`/`roman_ur` turns it must never reach
+    the JSON step's own prose, and for `ur`/`roman_ur` turns it must never reach
     the owner directly, whether raw or "polished". Building this summary
     from the contract's own structured fields (draft_bill / draft_action's
     `summary` / draft_document's `summary`) keeps it purely factual.
@@ -532,7 +538,7 @@ def _build_execution_summary(reply_data):
 
 
 def _write_final_reply(user_message, execution_summary, language):
-    """The 70B 'response writer' step. Composes a BRAND NEW reply from the
+    """The reasoning-tier 'response writer' step. Composes a BRAND NEW reply from the
     owner's original message plus a plain-language execution summary of
     what actually happened — it is never handed the JSON step's own
     sentence to rewrite. Deliberately does NOT receive the system prompt,
@@ -560,12 +566,11 @@ def _write_final_reply(user_message, execution_summary, language):
 
     try:
         if language == "roman_ur":
-            raw = call_groq(
+            raw = call_gemini_reasoning(
                 messages=[
                     {"role": "system", "content": prompt.RESPONSE_WRITER_ROMAN_UR},
                     {"role": "user", "content": user_content},
                 ],
-                reasoning=True,
             )
             composed = json.loads(raw)
             text = (composed.get("text") or "").strip()
@@ -576,12 +581,11 @@ def _write_final_reply(user_message, execution_summary, language):
             return text, (speech or to_urdu_script(text) or None)
 
         # language == "ur"
-        raw = call_groq(
+        raw = call_gemini_reasoning(
             messages=[
                 {"role": "system", "content": prompt.RESPONSE_WRITER_UR},
                 {"role": "user", "content": user_content},
             ],
-            reasoning=True,
             response_format_json=False,
         )
         composed = (raw or "").strip()
@@ -755,7 +759,7 @@ def generate_reply(*, business, conversation, text, language=None):
         # plus a plain-language summary of what was actually decided/done —
         # see _build_execution_summary / _write_final_reply. This is the
         # ONLY place a Roman Urdu/Urdu owner's final reply text comes from;
-        # 8B (or 70B on the JSON step) never reaches the owner directly.
+        # the JSON step's own model output never reaches the owner directly.
         summary = _build_execution_summary(reply_data)
         if save_now_duplicate:
             summary = (summary + " " if summary else "") + (

@@ -60,6 +60,13 @@ class DocumentDeliverySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = DocumentDelivery
+        # `error_message` is deliberately NOT exposed here: it is free-form
+        # text meant for server logs, not an owner-facing API response — a
+        # real incident had it carry an unrelated service's raw HTML error
+        # page, including this business's WhatsApp session id and a
+        # customer's phone number, in plaintext. `error_code` is the stable,
+        # safe signal; the client maps it to a curated message (see mobile's
+        # send_document_sheet.dart _friendlyDeliveryError).
         fields = [
             "id",
             "doc_type",
@@ -70,7 +77,6 @@ class DocumentDeliverySerializer(serializers.ModelSerializer):
             "customer_name",
             "status",
             "error_code",
-            "error_message",
             "byte_size",
             "created_at",
             "accepted_at",

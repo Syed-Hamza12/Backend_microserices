@@ -245,15 +245,37 @@ GEMINI_TEXT_FALLBACK_MODELS = [
 
 # Chat's fast/planner tier (see apps.chat.services.select_model_tier) — moved
 # off Groq's llama-3.1-8b-instant onto Google's Gemma via the Generative
-# Language API, sharing GEMINI_API_KEYS above (the same canonical Google
-# client apps.image_info_extractor.gemini_client uses — see
-# apps.integrations.google_genai_client). The reasoning tier
-# (GROQ_MODEL_REASONING above) is completely unaffected by this: it still
-# runs on Groq, unchanged.
+# Language API (the same canonical Google client
+# apps.image_info_extractor.gemini_client uses — see
+# apps.integrations.google_genai_client).
+#
+# FAST_GEMINI_API_KEYS is its own key pool, separate from GEMINI_API_KEYS
+# (OCR) and QUALITY_GEMINI_API_KEYS (chat's reasoning tier, below) — these
+# three features used to compete for one shared pool's free-tier daily
+# quota; splitting them means each gets its own independent allowance.
+# Falls back to GEMINI_API_KEYS if no dedicated keys are configured, so an
+# existing single-pool .env keeps working unchanged.
+FAST_GEMINI_API_KEYS = _collect_keys("FAST_GEMINI_API_KEY", max_n=20) or GEMINI_API_KEYS
 GOOGLE_FAST_MODEL = os.environ.get("GOOGLE_FAST_MODEL", "gemma-4-31b-it")
 GOOGLE_FAST_FALLBACK_MODELS = [
     m.strip()
     for m in os.environ.get("GOOGLE_FAST_FALLBACK_MODELS", "").split(",")
+    if m.strip()
+]
+
+# Chat's reasoning/quality tier (see apps.chat.services._call_model and
+# _write_final_reply) — moved off Groq's llama-3.3-70b-versatile onto
+# Gemini (apps.chat.google_client.call_gemini_reasoning). This is the
+# highest-volume chat traffic (every bill/edit/document-intent message,
+# plus the entire Roman Urdu/Urdu response-writer pass), so it gets its own
+# key pool, never shared with the fast tier or OCR — see FAST_GEMINI_API_KEYS
+# above for why that separation matters. Falls back to GEMINI_API_KEYS if
+# unset.
+QUALITY_GEMINI_API_KEYS = _collect_keys("QUALITY_GEMINI_API_KEY", max_n=20) or GEMINI_API_KEYS
+GOOGLE_QUALITY_MODEL = os.environ.get("GOOGLE_QUALITY_MODEL", "gemini-3.6-flash")
+GOOGLE_QUALITY_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get("GOOGLE_QUALITY_FALLBACK_MODELS", "gemini-flash-latest").split(",")
     if m.strip()
 ]
 
