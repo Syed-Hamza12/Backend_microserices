@@ -11,7 +11,8 @@ from apps.image_info_extractor import matching
 from apps.sales.business_date import BusinessDateError, business_today, resolve as resolve_business_date
 
 from . import prompt
-from .google_client import call_gemini_reasoning, call_gemini_text, call_gemma_planner
+from .google_client import call_gemma_planner
+from .groq_client import call_groq, call_groq_text
 from .models import ChatMessage
 from .serializers import AiReplySerializer
 
@@ -140,10 +141,10 @@ def transliterate_to_roman_urdu(text):
         return text
 
     try:
-        # The reasoning/quality tier's own key pool (call_gemini_text), not
-        # OCR's — see call_gemini_reasoning's docstring for why chat traffic
-        # needed its own pool separate from OCR's.
-        converted = call_gemini_text(
+        # Groq, not Gemini — this is ordinary per-message chat traffic, not
+        # OCR, and Gemini's free-tier daily quota is too low to carry it (as
+        # low as 20 requests/day on Flash models for this project).
+        converted = call_groq_text(
             prompt.TRANSLITERATION_INSTRUCTIONS, text[:MAX_TRANSLITERATE_CHARS]
         )
     except Exception as exc:  # noqa: BLE001 - never lose the owner's words to this
@@ -414,19 +415,18 @@ def to_urdu_script(text):
         return text
 
     try:
-        # Back on Gemini (call_gemini_text) — this is in fact the one call in
-        # this module Gemini was originally added FOR: Llama has a documented
-        # history of writing Urdu script badly enough to be unintelligible
-        # when spoken ("Mujhe samajh nahi aya" came back as "موجه سمجه نهين
-        # آدا" — Arabic ه for Urdu ھ/ہ, mangled words). It was moved to Groq
-        # for a time purely over Gemini's free-tier quota; that reasoning no
-        # longer applies now that chat has its own dedicated key pool (see
-        # call_gemini_reasoning's docstring). `has_urdu_script` below cannot
-        # catch the mangled-script failure mode on its own: the mangled
-        # output is still technically in the Urdu/Arabic Unicode block, so
-        # it looks "valid" to that check. If TTS starts sounding like noise
-        # again for Roman Urdu owners, this is the first place to look.
-        converted = call_gemini_text(
+        # Groq, not Gemini — moved off Gemini for quota reasons (Flash
+        # models on this project are capped at 20 requests/day), even though
+        # this is the one call Gemini was originally added FOR: Llama has a
+        # documented history of writing Urdu script badly enough to be
+        # unintelligible when spoken ("Mujhe samajh nahi aya" came back as
+        # "موجه سمجه نهين آدا" — Arabic ه for Urdu ھ/ہ, mangled words).
+        # `has_urdu_script` below cannot catch that failure mode on its own:
+        # the mangled output is still technically in the Urdu/Arabic Unicode
+        # block, so it looks "valid" to that check. If TTS starts sounding
+        # like noise again for Roman Urdu owners, this is the first place to
+        # look.
+        converted = call_groq_text(
             prompt.URDU_SCRIPT_INSTRUCTIONS, text[:MAX_TRANSLITERATE_CHARS]
         )
     except Exception as exc:  # noqa: BLE001 - speech is optional, the reply is not
@@ -476,15 +476,14 @@ def select_model_tier(message_text, language):
 
 
 def _call_model(tier, messages):
-    """The single dispatch point between the two chat-turn tiers. Both are
-    Gemini now: "fast" is Gemma (`call_gemma_planner`), "reasoning" is
-    Gemini's quality model (`call_gemini_reasoning`, replacing Groq's
-    llama-3.3-70b-versatile) — `select_model_tier`'s routing rule itself is
-    unchanged, only what each tier resolves to. Each keeps its own key pool
-    (see settings.FAST_GEMINI_API_KEYS / QUALITY_GEMINI_API_KEYS)."""
+    """The single dispatch point between the two chat-turn tiers. "fast" is
+    Gemma via Google (`apps.chat.google_client`); "reasoning" is Groq's
+    llama-3.3-70b-versatile (`apps.chat.groq_client`) — Gemini's free-tier
+    daily quota (as low as 20 requests/day on Flash models for this
+    project) can't carry reasoning-tier volume, so that tier stays on Groq."""
     if tier == "fast":
         return call_gemma_planner(messages=messages)
-    return call_gemini_reasoning(messages=messages)
+    return call_groq(messages=messages, reasoning=True)
 
 
 #: Languages whose final reply text/speech_text are COMPOSED FRESH by the
@@ -566,11 +565,12 @@ def _write_final_reply(user_message, execution_summary, language):
 
     try:
         if language == "roman_ur":
-            raw = call_gemini_reasoning(
+            raw = call_groq(
                 messages=[
                     {"role": "system", "content": prompt.RESPONSE_WRITER_ROMAN_UR},
                     {"role": "user", "content": user_content},
                 ],
+                reasoning=True,
             )
             composed = json.loads(raw)
             text = (composed.get("text") or "").strip()
@@ -581,11 +581,12 @@ def _write_final_reply(user_message, execution_summary, language):
             return text, (speech or to_urdu_script(text) or None)
 
         # language == "ur"
-        raw = call_gemini_reasoning(
+        raw = call_groq(
             messages=[
                 {"role": "system", "content": prompt.RESPONSE_WRITER_UR},
                 {"role": "user", "content": user_content},
             ],
+            reasoning=True,
             response_format_json=False,
         )
         composed = (raw or "").strip()

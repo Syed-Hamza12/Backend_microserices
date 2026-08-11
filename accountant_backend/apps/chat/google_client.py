@@ -1,24 +1,23 @@
-"""Chat's model clients — both tiers now run on Google's Generative Language
-API: `call_gemma_planner` (fast/planner tier, Gemma) and
-`call_gemini_reasoning`/`call_gemini_text` (reasoning/quality tier, replacing
-Groq's `llama-3.3-70b-versatile` — see `apps.chat.services._call_model` and
-`_write_final_reply`). Each tier uses its own key pool
-(`settings.FAST_GEMINI_API_KEYS` / `settings.QUALITY_GEMINI_API_KEYS`),
-never shared with each other or with OCR's `GEMINI_API_KEYS` — three
-features that used to compete for one shared free-tier daily quota now each
-get their own.
+"""Fast/planner-tier model for chat — Gemma, via Google's Generative
+Language API, replacing Groq's `llama-3.1-8b-instant` for ONLY the fast
+tier (see `apps.chat.services.select_model_tier`). The reasoning tier stays
+on Groq's `llama-3.3-70b-versatile` (`apps.chat.groq_client`) — Gemini's
+free-tier daily quota (as low as 20 requests/day on Flash models for this
+project) can't carry that tier's volume. Uses its own key pool
+(`settings.FAST_GEMINI_API_KEYS`), separate from OCR's `GEMINI_API_KEYS`.
 
 Key rotation and model-fallback mechanics are NOT reimplemented here — see
 `apps.integrations.google_genai_client`, the one canonical Google API
 client this codebase uses (shared with
 `apps.image_info_extractor.gemini_client`'s vision OCR extraction). This
-module owns exactly two things: which model/keys each tier requests, and
-translating between the OpenAI-style `{role, content}` messages list the
-rest of `apps.chat` already builds and Google's `genai`
-`contents`/`system_instruction` shape — so every function here returns a
-plain string (JSON text or plain text), the same contract Groq's
-`call_groq`/`call_groq_text` had before this swap. Callers in
-`apps.chat.services` do not need to know or care which provider answered.
+module owns exactly two things specific to the chat planner: which
+model/keys to request, and translating between the OpenAI-style
+`{role, content}` messages list the rest of `apps.chat` already builds and
+Google's `genai` `contents`/`system_instruction` shape — so
+`call_gemma_planner` returns a plain JSON string, identical in shape to
+what `apps.chat.groq_client.call_groq(reasoning=False)` returned before
+this swap. Callers in `apps.chat.services` do not need to know or care
+which provider answered.
 """
 
 import logging
@@ -81,43 +80,3 @@ def call_gemma_planner(*, messages, timeout=20):
     models = model_ladder(settings.GOOGLE_FAST_MODEL, settings.GOOGLE_FAST_FALLBACK_MODELS)
     response = generate(settings.FAST_GEMINI_API_KEYS, models, contents, config=config, logger=logger)
     return response.text
-
-
-def call_gemini_reasoning(*, messages, response_format_json=True, timeout=20):
-    """Runs the reasoning/quality-tier call through Gemini — replaces Groq's
-    `llama-3.3-70b-versatile` (see `apps.chat.services._call_model` and
-    `_write_final_reply`).
-
-    Same dual JSON/plain-text shape `apps.chat.groq_client.call_groq` had,
-    so callers needed no other change: JSON mode (the default) returns a
-    JSON string for `_call_model`'s and `_write_final_reply`'s JSON-mode
-    calls; `response_format_json=False` returns plain text, used by
-    `call_gemini_text` below for transliteration/speech-script conversion.
-
-    Uses its own key pool (`settings.QUALITY_GEMINI_API_KEYS`) — this is the
-    highest-volume chat traffic (every bill/edit/document-intent message,
-    plus the entire Roman Urdu/Urdu response-writer pass), so it gets its
-    own free-tier quota rather than competing with the fast tier or OCR.
-
-    `timeout` is accepted for interface parity with the old `call_groq`
-    but is not separately enforced here, same as `call_gemma_planner`.
-    """
-    system_instruction, contents = _to_google_contents(messages)
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json" if response_format_json else "text/plain",
-        system_instruction=system_instruction,
-    )
-    models = model_ladder(settings.GOOGLE_QUALITY_MODEL, settings.GOOGLE_QUALITY_FALLBACK_MODELS)
-    response = generate(settings.QUALITY_GEMINI_API_KEYS, models, contents, config=config, logger=logger)
-    return response.text
-
-
-def call_gemini_text(instructions: str, text: str) -> str:
-    """Plain text-in/text-out call on the reasoning/quality tier — for
-    transliteration and speech_text script conversion. Mirrors
-    `apps.chat.groq_client.call_groq_text`'s old shape exactly, just on
-    Gemini now (see `call_gemini_reasoning`)."""
-    return call_gemini_reasoning(
-        messages=[{"role": "user", "content": f"{instructions}\n\n{text}"}],
-        response_format_json=False,
-    )
