@@ -286,6 +286,12 @@ GOOGLE_QUALITY_FALLBACK_MODELS = [
 # and deliberately its own setting rather than reusing GEMINI_TEXT_MODEL: audio
 # transcription cost/accuracy tuning must not silently move the transliteration
 # path too.
+#
+# Its own key pool too, separate from GEMINI_API_KEYS (OCR) — every voice
+# note used to draw from OCR's quota; a business recording several voice
+# messages could exhaust the same pool a photographed bill needs. Falls
+# back to GEMINI_API_KEYS if unset.
+AUDIO_GEMINI_API_KEYS = _collect_keys("AUDIO_GEMINI_API_KEY", max_n=20) or GEMINI_API_KEYS
 GEMINI_AUDIO_MODEL = os.environ.get("GEMINI_AUDIO_MODEL", "gemini-3.1-flash-lite")
 GEMINI_AUDIO_FALLBACK_MODELS = [
     m.strip()

@@ -71,7 +71,7 @@ def transcribe_audio(audio_bytes: bytes, mime_type: str, *, language: str = "rom
     prompt = _PROMPT_TEMPLATE.format(language_instruction=language_instruction)
 
     response = generate(
-        settings.GEMINI_API_KEYS,
+        settings.AUDIO_GEMINI_API_KEYS,
         model_ladder(settings.GEMINI_AUDIO_MODEL, settings.GEMINI_AUDIO_FALLBACK_MODELS),
         [types.Part.from_bytes(data=audio_bytes, mime_type=mime_type), prompt],
         logger=logger,
