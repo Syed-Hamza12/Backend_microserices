@@ -327,6 +327,71 @@ AGGREGATE_HINT_PATTERN = re.compile(
 )
 
 
+# "ye WhatsApp mein send hogya?", "kya bhej diya?", "was it sent", "did it go
+# through" — the owner asking whether something already went out over
+# WhatsApp. Without this, the model had no ground truth for the question at
+# all (a send's real outcome is recorded in DocumentDelivery, but nothing
+# ever surfaced it back into the prompt) and produced a vague, evasive
+# non-answer instead of the plain yes/no/why-not the owner actually needs —
+# a real report: asked "ye WhatsApp m send krdiya?" after a bill was saved,
+# the model replied "aap WhatsApp status check kar sakte hain" (go check it
+# yourself), never having been told what actually happened.
+#: Spelling-tolerant word shapes, same principle as `_TAREEK_WORD_RE` above —
+#: "hogya"/"hogaya"/"ho gaya" are all the same word spoken/typed differently.
+_SEND_COMPLETION_WORD_RE = r"(?:hog[ae]?y?a|hua|gaya|diya|dia|kiya|kardiya|krdiya|krdia|done|complete|chuka|sent)"
+_SEND_WORD_RE = r"(?:send\w*|bhej\w*|whatsapp)"
+SEND_STATUS_HINT_PATTERN = re.compile(
+    r"\b" + _SEND_WORD_RE + r"\b.{0,30}\b" + _SEND_COMPLETION_WORD_RE + r"\b"
+    r"|\b" + _SEND_COMPLETION_WORD_RE + r"\b.{0,30}\b" + _SEND_WORD_RE + r"\b"
+    r"|\bwas\b.*\bsent\b|\bdid\b.*\b(send|go through)\b",
+    re.IGNORECASE,
+)
+
+
+def needs_send_status_context(message_text: str) -> bool:
+    return bool(SEND_STATUS_HINT_PATTERN.search(message_text or ""))
+
+
+def build_send_status_context(business):
+    """The real, authoritative outcome of the most recent WhatsApp document
+    sends for this business — from DocumentDelivery, the only place that
+    ever records what actually happened to a send (Baileys' accepted/failed
+    outcome, or a NOT_CONNECTED/GATEWAY_ERROR/etc reason it never went out
+    at all). See SEND_STATUS_HINT_PATTERN's comment for why the model must
+    never answer this from memory: it was never told the real outcome to
+    begin with, so any answer it gave was a guess dressed up as fact.
+    """
+    from apps.documents.models import DocumentDelivery
+
+    deliveries = list(
+        DocumentDelivery.objects.filter(business=business)
+        .select_related("customer")
+        .order_by("-created_at")[:5]
+    )
+    if not deliveries:
+        return (
+            "\n\nWhatsApp send history: no document has ever been sent (or attempted) over "
+            "WhatsApp for this business yet. If asked whether something was sent, say plainly "
+            "that nothing has been sent — do not guess or assume one went through."
+        )
+    lines = []
+    for d in deliveries:
+        who = wrap_untrusted(d.customer.name) if d.customer else "unknown customer"
+        when = timezone.localtime(d.created_at).strftime("%Y-%m-%d %H:%M")
+        if d.status == "accepted":
+            outcome = "WhatsApp accepted it (this is the honest ceiling of what we can confirm — never say 'delivered' or 'read', only that WhatsApp accepted it)"
+        elif d.status == "failed":
+            outcome = f"FAILED to send — reason: {d.error_code or 'unknown error'}"
+        else:
+            outcome = f"status: {d.status} (not yet a final outcome)"
+        lines.append(f"{d.doc_type} to {who} at {when}: {outcome}")
+    return (
+        "\n\nWhatsApp send history (most recent first — this is the complete, authoritative record "
+        "of what actually happened; if asked whether something was sent, answer ONLY from this, "
+        "never from the reply text of an earlier turn, and never guess):\n" + "\n".join(lines)
+    )
+
+
 def needs_aggregate_context(message_text: str) -> bool:
     return bool(AGGREGATE_HINT_PATTERN.search(message_text or ""))
 
@@ -885,6 +950,7 @@ def needs_entry_context(message_text: str) -> bool:
         EDIT_HINT_PATTERN.search(text)
         or BALANCE_HINT_PATTERN.search(text)
         or QUERY_HINT_PATTERN.search(text)
+        or SEND_STATUS_HINT_PATTERN.search(text)
         or extract_date_range_from_text(text) is not None
     )
 
@@ -1165,6 +1231,9 @@ def build_system_prompt(business, message_text="", language=None, conversation=N
     language_name = LANGUAGE_NAMES.get(language, "English")
     entry_context = build_entry_context(business, message_text) if needs_entry_context(message_text) else ""
     aggregate_context = build_aggregate_context(business) if needs_aggregate_context(message_text) else ""
+    send_status_context = (
+        build_send_status_context(business) if needs_send_status_context(message_text) else ""
+    )
     item_price_context = build_item_price_context(business, message_text, conversation=conversation)
     draft_context = build_current_draft_context(conversation) if conversation is not None else ""
     script_rule = SCRIPT_RULES.get(language, ENGLISH_SCRIPT_RULE)
@@ -1180,6 +1249,7 @@ def build_system_prompt(business, message_text="", language=None, conversation=N
         f"{build_business_context(business)}"
         f"{entry_context}"
         f"{aggregate_context}"
+        f"{send_status_context}"
         f"{item_price_context}"
         f"{draft_context}"
     )

@@ -223,10 +223,27 @@ def link_drafted_customer(business, draft_bill):
         return
 
     if not draft_bill.get("customer_id"):
-        customer, _candidates = matching.find_matching_customer(
+        customer, candidates = matching.find_matching_customer(
             business, draft_bill.get("customer_name_guess")
         )
         if not customer:
+            # The model named someone who matches no real customer clearly
+            # enough to act on without asking (a mis-transcription, a
+            # hallucinated name, or a genuinely new person it should have
+            # routed through draft_customer instead). Leaving
+            # customer_name_guess on an otherwise-unlinked draft let it
+            # through to the owner as if it were a normal, actionable bill
+            # ("Arif ka bill taiyar hai") for a customer that does not
+            # exist — the confirm button can never succeed
+            # (CUSTOMER_NOT_MATCHED) and the name was never real ground
+            # truth to begin with. Mark it unresolved instead of silently
+            # presenting it as a resolved draft — but `candidates` (a real
+            # customer this could plausibly be, e.g. "Kashif" heard for a
+            # real customer "Kaaif") is still worth surfacing so the
+            # clarifying question can offer it by name rather than making
+            # the owner retype it from nothing.
+            draft_bill["unresolved_customer"] = True
+            draft_bill["candidate_names"] = [c.name for c in candidates]
             return
         draft_bill["customer_id"] = str(customer.id)
         draft_bill["customer_name_guess"] = None
@@ -258,10 +275,18 @@ def link_drafted_payment_customer(business, draft_payment):
         return
 
     if not draft_payment.get("customer_id"):
-        customer, _candidates = matching.find_matching_customer(
+        customer, candidates = matching.find_matching_customer(
             business, draft_payment.get("customer_name_guess")
         )
         if not customer:
+            # Same reasoning as link_drafted_customer's unmatched-name case:
+            # a guessed name with no real match must never reach the owner
+            # looking like a resolved, confirmable payment record. Still
+            # surface any near-miss candidates (e.g. "Kashif" said, "Kaaif"
+            # meant) so the clarifying question can offer the likely real
+            # name instead of a blank "who do you mean?".
+            draft_payment["unresolved_customer"] = True
+            draft_payment["candidate_names"] = [c.name for c in candidates]
             return
         draft_payment["customer_id"] = str(customer.id)
         draft_payment["customer_name_guess"] = None
@@ -444,33 +469,31 @@ def to_urdu_script(text):
 
 
 def select_model_tier(message_text, language):
-    """Which model handles the JSON/intent step — two tiers, both Gemini now
-    (see `_call_model`). Purely intent-complexity-driven: `needs_reasoning`
-    recognises bill/edit/document intent in English, Urdu and Roman Urdu
-    alike, and that alone decides fast (Gemma) vs reasoning
-    (Gemini's quality model) for THIS step.
+    """Which model handles the JSON/intent step — two Groq tiers. Purely
+    intent-complexity-driven now: `needs_reasoning` recognises bill/edit/
+    document intent in English, Urdu and Roman Urdu alike, and that alone
+    decides fast (8B) vs reasoning (70B) for THIS step.
 
     Language used to force the reasoning tier by itself for ur/roman_ur,
-    unconditionally — because the fast-tier model cannot WRITE Urdu
-    acceptably (it once returned "پاپ کا جو 1 ڑڑ خَد 20 مۉّد" to a real
-    owner, which is not words). That write-quality problem is real, but it
-    is a problem with PROSE, not with understanding the message or filling
-    out the JSON contract — so it is now solved downstream instead: for
-    `ur`/`roman_ur`, the JSON step's own "text" is discarded entirely
-    (never shown to the owner, see `generate_reply`), and
-    `_write_final_reply` COMPOSES a fresh reply on the reasoning-tier model
-    from the owner's message plus a plain execution summary — never by
-    forcing the whole intent/planning step onto the expensive model, and
-    never by rewriting the JSON step's own sentence. See AGENTS.md /
-    AGENT_DATA_FLOW.md's model-routing sections for the full before/after
-    picture and the token-cost reasoning behind this.
+    unconditionally — because 8B cannot WRITE Urdu acceptably (it once
+    returned "پاپ کا جو 1 ڑڑ خَد 20 مۉّد" to a real owner, which is not
+    words). That write-quality problem is real, but it is a problem with
+    PROSE, not with understanding the message or filling out the JSON
+    contract — so it is now solved downstream instead: for `ur`/`roman_ur`,
+    the JSON step's own "text" is discarded entirely (never shown to the
+    owner, see `generate_reply`), and `_write_final_reply` COMPOSES a fresh
+    reply on 70B from the owner's message plus a plain execution summary —
+    never by forcing the whole intent/planning step onto the expensive
+    model, and never by rewriting the JSON step's own sentence. See
+    AGENTS.md / AGENT_DATA_FLOW.md's model-routing sections for the full
+    before/after picture and the token-cost reasoning behind this.
 
-    Chat's two tiers each have their own Gemini key pool
-    (`settings.FAST_GEMINI_API_KEYS` / `QUALITY_GEMINI_API_KEYS`), separate
-    from OCR's (`GEMINI_API_KEYS`,
-    `apps.image_info_extractor.gemini_client.extract_receipt_data`) — three
-    features that would otherwise compete for one shared free-tier daily
-    quota.
+    Gemini is not used for chat's reasoning tier at all — its free-tier
+    quota (as low as 20 requests/day on Flash models for this project) can't
+    carry ordinary chat volume; it is reserved for chat's fast tier
+    (`FAST_GEMINI_API_KEYS`), voice transcription (`AUDIO_GEMINI_API_KEYS`),
+    and `apps.image_info_extractor.gemini_client.extract_receipt_data`
+    (OCR) only.
     """
     return "reasoning" if prompt.needs_reasoning(message_text) else "fast"
 
@@ -507,6 +530,21 @@ def _build_execution_summary(reply_data):
     """
     draft_bill = reply_data.get("draft_bill")
     if isinstance(draft_bill, dict):
+        if draft_bill.get("unresolved_customer"):
+            guess = draft_bill.get("customer_name_guess")
+            candidate_names = draft_bill.get("candidate_names") or []
+            if candidate_names:
+                return (
+                    f"The owner said a name close to '{guess}' for a bill, which did not exactly match "
+                    f"any customer, but close possible matches on this account are: "
+                    f"{', '.join(candidate_names)}. Nothing was recorded — ask the owner to confirm "
+                    "which of these (if any) they meant."
+                )
+            return (
+                f"The owner mentioned a customer named '{guess}' for a bill, but no customer with "
+                "that name exists on this account yet. Nothing was recorded — ask the owner to "
+                "confirm the customer's correct name, or say if this is a new customer."
+            )
         bits = ["A sales bill was prepared"]
         if draft_bill.get("customer_name") or draft_bill.get("customer_name_guess"):
             bits.append(f"for customer {draft_bill.get('customer_name') or draft_bill.get('customer_name_guess')}")
@@ -520,6 +558,33 @@ def _build_execution_summary(reply_data):
             else "it is awaiting the owner's confirmation before it is recorded"
         )
         return ", ".join(bits) + f"; {status}."
+
+    draft_payment = reply_data.get("draft_payment")
+    if isinstance(draft_payment, dict):
+        guess = draft_payment.get("customer_name_guess")
+        if draft_payment.get("unresolved_customer"):
+            candidate_names = draft_payment.get("candidate_names") or []
+            if candidate_names:
+                return (
+                    f"The owner said a name close to '{guess}' for a payment, which did not exactly "
+                    f"match any customer, but close possible matches on this account are: "
+                    f"{', '.join(candidate_names)}. Nothing was recorded — ask the owner to confirm "
+                    "which of these (if any) they meant."
+                )
+            return (
+                f"The owner mentioned a customer named '{guess}' for a payment, but no customer "
+                "with that name exists on this account yet. Nothing was recorded — ask the owner "
+                "to confirm the customer's correct name, or say if this is a new customer."
+            )
+        bits = ["A payment record was prepared"]
+        name = draft_payment.get("customer_name") or guess
+        if name:
+            bits.append(f"for customer {name}")
+        if draft_payment.get("full_balance"):
+            bits.append("for their full outstanding balance")
+        elif draft_payment.get("amount") is not None:
+            bits.append(f"amount {draft_payment['amount']}")
+        return ", ".join(bits) + "; it is awaiting the owner's confirmation before it is recorded."
 
     draft_action = reply_data.get("draft_action")
     if isinstance(draft_action, dict) and draft_action.get("summary"):
@@ -649,12 +714,39 @@ def generate_reply(*, business, conversation, text, language=None):
     link_drafted_customer(business, reply_data.get("draft_bill"))
     link_drafted_payment_customer(business, reply_data.get("draft_payment"))
 
+    # A guessed name that matched no real customer must never reach the
+    # owner as an actionable card ("Arif ka bill/payment taiyar hai") — the
+    # confirm button can never succeed for it (CUSTOMER_NOT_MATCHED) and the
+    # name itself may not even be real (a mis-transcription or a
+    # hallucinated one). Drop the draft and replace the JSON step's own
+    # (possibly overconfident) "text" with a plain clarifying question —
+    # for ur/roman_ur this text is only a discarded placeholder anyway
+    # (see below), but for English it IS the final reply, so it must be
+    # corrected here rather than left claiming a record was prepared.
+    for draft_key in ("draft_bill", "draft_payment"):
+        draft = reply_data.get(draft_key)
+        if isinstance(draft, dict) and draft.get("unresolved_customer"):
+            guess = draft.get("customer_name_guess") or "that customer"
+            candidate_names = draft.get("candidate_names") or []
+            reply_data[draft_key] = None
+            if candidate_names:
+                reply_data["text"] = (
+                    f"I heard '{guess}' but couldn't match it exactly — did you mean "
+                    f"{' or '.join(candidate_names)}? Please confirm the name."
+                )
+            else:
+                reply_data["text"] = (
+                    f"I couldn't find a customer named '{guess}' on your account. "
+                    "Could you confirm the correct name, or let me know if they're a new customer?"
+                )
+            reply_data["speech_text"] = None
+
     # For ur/roman_ur, the JSON step's own "text" is NEVER the final reply —
     # it is stored here only as a placeholder until the response-writer step
     # below composes the real one from execution facts. For every other
     # language (or a failed call, whose reply_data is already the fixed,
     # correctly-localized FALLBACK_REPLIES text) it IS the final reply.
-    ChatMessage.objects.create(conversation=conversation, sender="owner", text=text)
+    owner_message = ChatMessage.objects.create(conversation=conversation, sender="owner", text=text)
     # A "report" has no single recipient — it can span every customer in the
     # business — so it can never be sent via the confirm/send pipeline
     # (/documents/send/ requires a resolvable phone number and 400s with
@@ -719,6 +811,35 @@ def generate_reply(*, business, conversation, text, language=None):
         # WhatsApp send when the owner's own words also asked for it (see
         # _SEND_INTENT_PATTERN's docstring on record_drafted_bill).
         also_send = bool(_SEND_INTENT_PATTERN.search(text or ""))
+        if not also_send:
+            # The owner's "save AND send" request can fail on its first
+            # attempt (a transient model/parse error, recorded as
+            # is_error_fallback) and get re-sent as a short, bare nudge with
+            # no send wording of its own ("pls", "try again"). That nudge is
+            # a continuation of the same request, not a new, narrower one —
+            # a real report: "save bhi karo aur WhatsApp mein bhej bhi do"
+            # failed, the owner retried with "pls", and the bill was saved
+            # but silently never sent because THIS turn's own words no
+            # longer mentioned WhatsApp at all.
+            #
+            # `_recent_history` deliberately EXCLUDES is_error_fallback
+            # messages from the model's own context (they're the app
+            # apologising, not real assistant reasoning) — so that filtered
+            # `history` can never surface the failed turn here. Query the
+            # raw, unfiltered timeline directly instead, immediately before
+            # this turn's own two just-created messages (owner text + this
+            # ai_message).
+            preceding = list(
+                conversation.messages
+                .exclude(pk__in=[owner_message.pk, ai_message.pk])
+                .order_by("-timestamp", "-id")[:2]
+            )
+            if (
+                len(preceding) == 2
+                and preceding[0].sender == "ai" and preceding[0].is_error_fallback
+                and preceding[1].sender == "owner"
+            ):
+                also_send = bool(_SEND_INTENT_PATTERN.search(preceding[1].text or ""))
         save_result, delivery = record_drafted_bill(business, ai_message, also_send=also_send)
         if save_result != "saved":
             save_now_failed = save_result == "failed"

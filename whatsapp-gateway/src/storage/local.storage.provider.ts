@@ -26,8 +26,17 @@ export class LocalStorageProvider implements StorageProvider {
     }
 
     async listSessionIds(): Promise<string[]> {
+        // Non-directory entries under SESSION_PATH are real (e.g.
+        // rate-limit-state.json — see src/config/rateLimit.ts — lives in
+        // this same folder) and must never be treated as a session id: a
+        // plain `readdir` returned every entry regardless of type, so this
+        // file was handed to `useMultiFileAuthState` as if it were a
+        // session directory, which throws ("found something that is not a
+        // directory") and parks every real session as unrestorable on
+        // every boot.
         try {
-            return await readdir(env.SESSION_PATH);
+            const entries = await readdir(env.SESSION_PATH, { withFileTypes: true });
+            return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
         } catch {
             return [];
         }

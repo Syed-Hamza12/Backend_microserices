@@ -51,12 +51,36 @@ bookkeeping assistant about a sale, payment, or customer. {language_instruction}
 Rules:
 - Output ONLY the transcript text, nothing else — no preamble, no quotes, no
   commentary.
-- If you cannot make out any speech at all (silence, noise, unintelligible),
-  output exactly: [inaudible]
+- This audio may be silent, near-silent, pure background noise, or too short
+  to contain real words. That is a NORMAL and EXPECTED input, not an error —
+  do not assume someone must have spoken just because a message was sent.
+- If you cannot clearly make out actual spoken words — silence, noise,
+  a click, an accidental recording, or anything you are not genuinely
+  confident is real speech — output exactly: [inaudible]
+- NEVER invent, guess, or fill in words, names, or numbers that you are not
+  certain you actually heard. This transcript becomes a real financial
+  record for this shopkeeper — a fabricated name or amount (e.g. inventing
+  a customer or a payment that was never said) is a far worse outcome than
+  outputting [inaudible] and asking them to record it again. When in doubt,
+  output [inaudible].
 - Numbers, amounts, and customer names matter most here — a shopkeeper's own
   ledger entries turn into money records, so get digits and names right over
-  smoothing the phrasing.
+  smoothing the phrasing. Getting them right also means never supplying one
+  you didn't actually hear.
 """.strip()
+
+#: Below this many bytes, a recording cannot plausibly contain a real spoken
+#: sentence in any of the mobile app's supported audio formats — this is
+#: the case that was observed actually fabricating a transcript ("Arif ko
+#: 400 rupe de do" from an empty/near-empty recording): asking the model at
+#: all invites it to pattern-match onto its own shopkeeper-domain priming
+#: and hallucinate plausible speech rather than reliably admitting there was
+#: none. Skipping the model call entirely for these removes that failure
+#: mode outright instead of relying on the model to self-report honestly.
+#: Deliberately conservative (a real 1-2 second voice note is comfortably
+#: larger than this in every format the app uploads) so this never discards
+#: genuine short speech, only recordings too small to contain any.
+MIN_AUDIO_BYTES_FOR_TRANSCRIPTION = 2000
 
 
 def transcribe_audio(audio_bytes: bytes, mime_type: str, *, language: str = "roman_ur") -> str:
@@ -67,6 +91,14 @@ def transcribe_audio(audio_bytes: bytes, mime_type: str, *, language: str = "rom
     apps.image_info_extractor.gemini_client.extract_receipt_data (see
     services.handle_voice_transcribe_job's fallback-apology path).
     """
+    if len(audio_bytes) < MIN_AUDIO_BYTES_FOR_TRANSCRIPTION:
+        logger.info(
+            "voice note too small to contain real speech (%s bytes) — skipping "
+            "transcription instead of risking a hallucinated transcript",
+            len(audio_bytes),
+        )
+        return ""
+
     language_instruction = _LANGUAGE_INSTRUCTIONS.get(language, DEFAULT_INSTRUCTION)
     prompt = _PROMPT_TEMPLATE.format(language_instruction=language_instruction)
 
