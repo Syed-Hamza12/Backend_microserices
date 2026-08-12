@@ -2,7 +2,7 @@ import logging
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
-from django.db.models import Count, F, Max
+from django.db.models import Count, F, Max, Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status
@@ -45,6 +45,54 @@ def _release_draft_claim(message):
     draft the UI thinks was already sent."""
     ChatMessage.objects.filter(pk=message.pk).update(draft_confirmed=False)
     message.draft_confirmed = False
+
+
+#: Mirrors apps.chat.prompt.build_current_draft_context's own definition of
+#: "the current draft" — any AI message in the conversation carrying one of
+#: these fields, unconfirmed. Kept as one tuple so the superseded-check
+#: below and that prompt-context builder can never quietly drift apart on
+#: what counts as a draft.
+_DRAFT_FIELD_NAMES = ("draft_bill", "draft_action", "draft_document", "draft_customer", "draft_payment")
+
+
+def _reject_if_superseded(message):
+    """None of the five Confirm*Views ever checked whether THIS draft was
+    still the current one — only whether it had already been confirmed
+    itself. Scrolling back to an older, still-unconfirmed draft card (from
+    before a correction/newer draft was made) and tapping Confirm on it
+    silently went through: a second sale recorded, a second WhatsApp
+    invoice sent, for a bill the owner had already moved past. Confirming
+    is only ever valid against the single most recent unconfirmed draft in
+    the conversation — the same "current draft" a newer AI turn already
+    assumes it's the only one when it answers "confirm the draft" — so any
+    strictly newer one existing means this message is stale.
+
+    Returns an error Response if `message` has been superseded, else None.
+    """
+    exclude_kwargs = {name: None for name in _DRAFT_FIELD_NAMES}
+    newer_exists = (
+        message.conversation.messages
+        .filter(sender="ai", draft_confirmed=False)
+        .exclude(pk=message.pk)
+        .exclude(**exclude_kwargs)
+        .filter(
+            Q(timestamp__gt=message.timestamp)
+            | Q(timestamp=message.timestamp, id__gt=message.id)
+        )
+        .exists()
+    )
+    if not newer_exists:
+        return None
+    return Response(
+        {
+            "success": False,
+            "error": {
+                "code": "DRAFT_SUPERSEDED",
+                "message": "A newer draft has replaced this one — this draft has expired and can no longer be confirmed.",
+            },
+        },
+        status=status.HTTP_400_BAD_REQUEST,
+    )
 
 
 def _money(value, field_name):
@@ -445,6 +493,10 @@ class ConfirmDraftBillView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        superseded_error = _reject_if_superseded(message)
+        if superseded_error is not None:
+            return superseded_error
+
         # Claim the draft before recording anything. Checking `draft_confirmed`
         # and setting it after the sale was written left a window wide enough
         # for a double tap on a slow connection to record the same sale twice —
@@ -573,6 +625,10 @@ class ConfirmDraftActionView(APIView):
                 {"success": False, "error": {"code": "NO_DRAFT_ACTION", "message": "This message has no draft action."}},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        superseded_error = _reject_if_superseded(message)
+        if superseded_error is not None:
+            return superseded_error
 
         # Same single-claim guard as ConfirmDraftBillView: without it a double
         # tap applied the same AI-proposed edit twice, and the second undo
@@ -897,6 +953,10 @@ class ConfirmDraftDocumentView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        superseded_error = _reject_if_superseded(message)
+        if superseded_error is not None:
+            return superseded_error
+
         # Same single-claim guard as the other confirms: a double tap must not
         # queue two identical documents to the customer.
         claimed = ChatMessage.objects.filter(pk=message.pk, draft_confirmed=False).update(draft_confirmed=True)
@@ -1024,6 +1084,10 @@ class ConfirmDraftCustomerView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        superseded_error = _reject_if_superseded(message)
+        if superseded_error is not None:
+            return superseded_error
+
         claimed = ChatMessage.objects.filter(pk=message.pk, draft_confirmed=False).update(draft_confirmed=True)
         if not claimed:
             return Response(
@@ -1124,6 +1188,10 @@ class ConfirmDraftPaymentView(APIView):
                 {"success": False, "error": {"code": "NO_DRAFT_PAYMENT", "message": "This message has no payment proposal."}},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        superseded_error = _reject_if_superseded(message)
+        if superseded_error is not None:
+            return superseded_error
 
         claimed = ChatMessage.objects.filter(pk=message.pk, draft_confirmed=False).update(draft_confirmed=True)
         if not claimed:
