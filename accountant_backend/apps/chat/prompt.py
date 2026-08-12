@@ -955,6 +955,65 @@ def needs_entry_context(message_text: str) -> bool:
     )
 
 
+#: Strict cap for the live WhatsApp status check inside build_business_context
+#: — that function runs on EVERY chat message, so a Gateway that's slow or
+#: down must not slow down or break the whole reply. Short enough that a
+#: hung Gateway costs at most this much extra latency per message, not a
+#: request timeout.
+_WHATSAPP_STATUS_CHECK_TIMEOUT = 3
+
+
+def _live_whatsapp_state(business):
+    """The REAL, current WhatsApp connection state for this business —
+    never just whether a session id happens to be stored.
+
+    Previously this only checked `business.gateway_session_id` truthiness,
+    which is set once at first connect and only ever cleared by an explicit
+    unlink() call — NOT by WhatsApp itself remotely logging the device out
+    (a "device_removed" conflict from the owner unlinking on their phone).
+    A real report: the owner logged WhatsApp out from their own phone, the
+    Gateway correctly detected it and marked the session UNLINKED, but the
+    AI was still asked "is my WhatsApp connected?" and said yes — because
+    gateway_session_id was still sitting in the database, untouched. This
+    calls the Gateway's own live status instead, with a strict timeout and
+    a safe, honest fallback if that check itself can't complete in time.
+    """
+    if not business.gateway_session_id:
+        return "NO WhatsApp number is connected to this business at all."
+
+    from apps.whatsapp import gateway_client
+    from apps.whatsapp.gateway_client import GatewayError
+
+    try:
+        data = gateway_client.get_status(
+            business.gateway_session_id, timeout=_WHATSAPP_STATUS_CHECK_TIMEOUT
+        )
+    except GatewayError:
+        # Gateway unreachable/slow/erroring right now — this is genuinely
+        # unknown, not "connected." Say so rather than asserting either way.
+        return (
+            "WhatsApp's live connection status could not be checked just now (the connection "
+            "service didn't respond in time). Do not claim it is definitely connected or "
+            "disconnected — tell the owner to check WhatsApp status in Settings if it matters "
+            "for what they're asking."
+        )
+
+    status = data.get("status")
+    if status == "CONNECTED":
+        phone = data.get("phone")
+        return f"WhatsApp IS connected and ready to send" + (f" (linked number: {phone})" if phone else "") + "."
+    if status in ("UNLINKED", "ERROR"):
+        reason = data.get("lastError")
+        return (
+            "WhatsApp is NOT connected — it was linked before but has since been disconnected/logged "
+            f"out{f' ({reason})' if reason else ''}. It must be reconnected in Settings before anything "
+            "can be sent over WhatsApp. If asked whether WhatsApp is connected, say clearly that it is "
+            "NOT, never that it is."
+        )
+    # CONNECTING/QR_READY/RECONNECTING/etc — mid-flight, not yet usable.
+    return f"WhatsApp is still in the process of connecting (status: {status}) — not yet ready to send."
+
+
 def build_business_context(business):
     today = timezone.localdate()
     recent_customers = list(
@@ -976,17 +1035,7 @@ def build_business_context(business):
     )
     todays_total = sum(todays_sales_total) if todays_sales_total else 0
 
-    # Read off the business row rather than calling the Gateway: this runs on
-    # every chat message, and a status endpoint that is slow or down must not
-    # slow down or break the reply. Absence of a session id is decisive — no
-    # session means nothing can have been sent, which is the case the model was
-    # getting wrong.
-    whatsapp_state = (
-        "a WhatsApp number is linked to this business (delivery still has to be "
-        "started by the owner, and may still fail)"
-        if business.gateway_session_id
-        else "NO WhatsApp number is connected to this business at all"
-    )
+    whatsapp_state = _live_whatsapp_state(business)
 
     return (
         f"You are the accountant for {business.business_name}. Today's date is {today.isoformat()}. "

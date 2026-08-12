@@ -100,8 +100,13 @@ def connect_session(gateway_session_id):
     return _request("POST", f"/sessions/{gateway_session_id}/connect", session_id=gateway_session_id).json()["data"]
 
 
-def get_status(gateway_session_id):
-    return _request("GET", f"/sessions/{gateway_session_id}/status", session_id=gateway_session_id).json()["data"]
+def get_status(gateway_session_id, *, timeout=DEFAULT_TIMEOUT):
+    # `timeout` is overridable (see apps.chat.prompt._live_whatsapp_state,
+    # which calls this on every chat reply and needs a short, strict cap —
+    # a status check that itself hangs must not hang the whole chat turn).
+    return _request(
+        "GET", f"/sessions/{gateway_session_id}/status", session_id=gateway_session_id, timeout=timeout
+    ).json()["data"]
 
 
 def get_qr_bytes(gateway_session_id):
