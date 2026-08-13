@@ -207,54 +207,14 @@ GROQ_MODEL_REASONING = os.environ.get("GROQ_MODEL_REASONING", "llama-3.3-70b-ver
 # that job cleanly with a NOT_CONFIGURED error until at least one key is added. Same
 # GEMINI_API_KEY_1.._20 rotation convention as Groq above.
 GEMINI_API_KEYS = _collect_keys("GEMINI_API_KEY", max_n=20)
-# Handwritten shopkeeper bills are the hard case, and flash-lite misreads them often
-# enough to matter. Note the *Pro* models are not a drop-in upgrade here: on the free
-# tier they return 429 RESOURCE_EXHAUSTED, which would fail every extraction. Stay on a
-# flash-tier model unless the key is on a paid plan.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-
-# Tried in order when GEMINI_MODEL fails. The failure this exists for is
-# `503 UNAVAILABLE - "This model is currently experiencing high demand"`, which
-# took out receipt extraction entirely: it is the model being busy, so retrying
-# on another API key changes nothing. Keep these flash-tier for the same reason
-# GEMINI_MODEL is (Pro 429s on a free-tier key).
-#
-# Reading a handwritten bill is the accuracy-critical path in this product — a
-# misread rate becomes wrong money on someone's ledger — so vision NEVER falls
-# back to a lite model. `gemini-2.5-flash` is deliberately absent: Google has
-# retired it for newer API keys (404 "no longer available to new users"), so a
-# chain containing it breaks the moment a fresh key is added to the rotation.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_FALLBACK_MODELS = [
     m.strip()
     for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-flash-latest").split(",")
     if m.strip()
 ]
 
-# Transliteration only (Urdu script <-> Roman Urdu). Not accuracy-critical in
-# the money sense — the worst case is an awkward-sounding word — so this may use
-# a lighter, cheaper model than vision. Kept separate precisely so tuning chat
-# costs can never quietly downgrade receipt reading.
-GEMINI_TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.6-flash")
-GEMINI_TEXT_FALLBACK_MODELS = [
-    m.strip()
-    for m in os.environ.get(
-        "GEMINI_TEXT_FALLBACK_MODELS", "gemini-flash-latest,gemini-3.1-flash-lite"
-    ).split(",")
-    if m.strip()
-]
 
-# Chat's fast/planner tier (see apps.chat.services.select_model_tier) — moved
-# off Groq's llama-3.1-8b-instant onto Google's Gemma via the Generative
-# Language API (the same canonical Google client
-# apps.image_info_extractor.gemini_client uses — see
-# apps.integrations.google_genai_client).
-#
-# FAST_GEMINI_API_KEYS is its own key pool, separate from GEMINI_API_KEYS
-# (OCR) and QUALITY_GEMINI_API_KEYS (chat's reasoning tier, below) — these
-# three features used to compete for one shared pool's free-tier daily
-# quota; splitting them means each gets its own independent allowance.
-# Falls back to GEMINI_API_KEYS if no dedicated keys are configured, so an
-# existing single-pool .env keeps working unchanged.
 FAST_GEMINI_API_KEYS = _collect_keys("FAST_GEMINI_API_KEY", max_n=20) or GEMINI_API_KEYS
 GOOGLE_FAST_MODEL = os.environ.get("GOOGLE_FAST_MODEL", "gemma-4-31b-it")
 GOOGLE_FAST_FALLBACK_MODELS = [
@@ -271,31 +231,19 @@ GOOGLE_FAST_FALLBACK_MODELS = [
 # key pool, never shared with the fast tier or OCR — see FAST_GEMINI_API_KEYS
 # above for why that separation matters. Falls back to GEMINI_API_KEYS if
 # unset.
-QUALITY_GEMINI_API_KEYS = _collect_keys("QUALITY_GEMINI_API_KEY", max_n=20) or GEMINI_API_KEYS
-GOOGLE_QUALITY_MODEL = os.environ.get("GOOGLE_QUALITY_MODEL", "gemini-3.6-flash")
+QUALITY_GEMINI_API_KEYS = _collect_keys("GEMNI_REASONING_KEY", max_n=20) or GEMINI_API_KEYS
+GOOGLE_QUALITY_MODEL = os.environ.get("GOOGLE_QUALITY_MODEL", "gemini-3.5-flash-lite")
 GOOGLE_QUALITY_FALLBACK_MODELS = [
     m.strip()
-    for m in os.environ.get("GOOGLE_QUALITY_FALLBACK_MODELS", "gemini-flash-latest").split(",")
+    for m in os.environ.get("GOOGLE_QUALITY_FALLBACK_MODELS", "gemini-3.5-flash-lite").split(",")
     if m.strip()
 ]
 
-# Voice-note transcription (apps.voice_transcriber): a recorded chat message is
-# uploaded as audio and transcribed here before it ever reaches the chat
-# planner — see apps.voice_transcriber.google_client. Kept on the same
-# flash-tier constraint as GEMINI_TEXT_MODEL above (this key's Pro models 429),
-# and deliberately its own setting rather than reusing GEMINI_TEXT_MODEL: audio
-# transcription cost/accuracy tuning must not silently move the transliteration
-# path too.
-#
-# Its own key pool too, separate from GEMINI_API_KEYS (OCR) — every voice
-# note used to draw from OCR's quota; a business recording several voice
-# messages could exhaust the same pool a photographed bill needs. Falls
-# back to GEMINI_API_KEYS if unset.
 AUDIO_GEMINI_API_KEYS = _collect_keys("AUDIO_GEMINI_API_KEY", max_n=20) or GEMINI_API_KEYS
-GEMINI_AUDIO_MODEL = os.environ.get("GEMINI_AUDIO_MODEL", "gemini-3.1-flash-lite")
+GEMINI_AUDIO_MODEL = os.environ.get("GEMINI_AUDIO_MODEL", "gemini-3.5-flash-lite")
 GEMINI_AUDIO_FALLBACK_MODELS = [
     m.strip()
-    for m in os.environ.get("GEMINI_AUDIO_FALLBACK_MODELS", "gemini-flash-latest").split(",")
+    for m in os.environ.get("GEMINI_AUDIO_FALLBACK_MODELS", "gemini-3.5-flash-lite").split(",")
     if m.strip()
 ]
 

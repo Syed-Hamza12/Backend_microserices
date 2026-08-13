@@ -80,3 +80,31 @@ def call_gemma_planner(*, messages, timeout=20):
     models = model_ladder(settings.GOOGLE_FAST_MODEL, settings.GOOGLE_FAST_FALLBACK_MODELS)
     response = generate(settings.FAST_GEMINI_API_KEYS, models, contents, config=config, logger=logger)
     return response.text
+
+
+def call_gemini_reasoning(*, messages, response_format_json=True, timeout=20):
+    """Reasoning tier — mirrors call_gemma_planner exactly, but against the
+    quality key pool/model ladder instead of the fast one. Replaces every
+    use of `apps.chat.groq_client.call_groq(reasoning=True)`. Same return
+    contract: a raw text string (JSON string when response_format_json is
+    True, plain text otherwise) so callers in apps.chat.services need no
+    other change.
+    """
+    system_instruction, contents = _to_google_contents(messages)
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        **({"response_mime_type": "application/json"} if response_format_json else {}),
+    )
+    models = model_ladder(settings.GOOGLE_QUALITY_MODEL, settings.GOOGLE_QUALITY_FALLBACK_MODELS)
+    response = generate(settings.QUALITY_GEMINI_API_KEYS, models, contents, config=config, logger=logger)
+    return response.text
+
+
+def call_gemini_text(instructions: str, text: str) -> str:
+    """Plain text-in/text-out call on the reasoning tier — replaces
+    `apps.chat.groq_client.call_groq_text`, used for transliteration and
+    Urdu-script conversion (apps.chat.services)."""
+    return call_gemini_reasoning(
+        messages=[{"role": "user", "content": f"{instructions}\n\n{text}"}],
+        response_format_json=False,
+    )

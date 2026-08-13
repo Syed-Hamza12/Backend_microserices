@@ -11,8 +11,8 @@ from apps.image_info_extractor import matching
 from apps.sales.business_date import BusinessDateError, business_today, resolve as resolve_business_date
 
 from . import prompt
-from .google_client import call_gemma_planner
-from .groq_client import call_groq, call_groq_text
+from .google_client import call_gemma_planner , call_gemini_reasoning, call_gemini_text
+# from .groq_client import call_groq, call_groq_text
 from .models import ChatMessage
 from .serializers import AiReplySerializer
 
@@ -144,9 +144,7 @@ def transliterate_to_roman_urdu(text):
         # Groq, not Gemini — this is ordinary per-message chat traffic, not
         # OCR, and Gemini's free-tier daily quota is too low to carry it (as
         # low as 20 requests/day on Flash models for this project).
-        converted = call_groq_text(
-            prompt.TRANSLITERATION_INSTRUCTIONS, text[:MAX_TRANSLITERATE_CHARS]
-        )
+        converted = call_gemini_text(prompt.TRANSLITERATION_INSTRUCTIONS, text[:MAX_TRANSLITERATE_CHARS])
     except Exception as exc:  # noqa: BLE001 - never lose the owner's words to this
         logger.warning("transliteration failed, returning original text: %s", exc)
         return text
@@ -451,9 +449,7 @@ def to_urdu_script(text):
         # block, so it looks "valid" to that check. If TTS starts sounding
         # like noise again for Roman Urdu owners, this is the first place to
         # look.
-        converted = call_groq_text(
-            prompt.URDU_SCRIPT_INSTRUCTIONS, text[:MAX_TRANSLITERATE_CHARS]
-        )
+        converted = call_gemini_text(prompt.URDU_SCRIPT_INSTRUCTIONS, text[:MAX_TRANSLITERATE_CHARS])
     except Exception as exc:  # noqa: BLE001 - speech is optional, the reply is not
         logger.warning("urdu-script conversion failed: %s", exc)
         return ""
@@ -498,15 +494,20 @@ def select_model_tier(message_text, language):
     return "reasoning" if prompt.needs_reasoning(message_text) else "fast"
 
 
+# def _call_model(tier, messages):
+#     """The single dispatch point between the two chat-turn tiers. "fast" is
+#     Gemma via Google (`apps.chat.google_client`); "reasoning" is Groq's
+#     llama-3.3-70b-versatile (`apps.chat.groq_client`) — Gemini's free-tier
+#     daily quota (as low as 20 requests/day on Flash models for this
+#     project) can't carry reasoning-tier volume, so that tier stays on Groq."""
+#     if tier == "fast":
+#         return call_gemma_planner(messages=messages)
+#     return call_groq(messages=messages, reasoning=True)
+
 def _call_model(tier, messages):
-    """The single dispatch point between the two chat-turn tiers. "fast" is
-    Gemma via Google (`apps.chat.google_client`); "reasoning" is Groq's
-    llama-3.3-70b-versatile (`apps.chat.groq_client`) — Gemini's free-tier
-    daily quota (as low as 20 requests/day on Flash models for this
-    project) can't carry reasoning-tier volume, so that tier stays on Groq."""
     if tier == "fast":
         return call_gemma_planner(messages=messages)
-    return call_groq(messages=messages, reasoning=True)
+    return call_gemini_reasoning(messages=messages)   # was call_groq(messages=messages, reasoning=True)
 
 
 #: Languages whose final reply text/speech_text are COMPOSED FRESH by the
@@ -630,13 +631,10 @@ def _write_final_reply(user_message, execution_summary, language):
 
     try:
         if language == "roman_ur":
-            raw = call_groq(
-                messages=[
-                    {"role": "system", "content": prompt.RESPONSE_WRITER_ROMAN_UR},
-                    {"role": "user", "content": user_content},
-                ],
-                reasoning=True,
-            )
+            raw = call_gemini_reasoning(messages=[
+            {"role": "system", "content": prompt.RESPONSE_WRITER_ROMAN_UR},
+            {"role": "user", "content": user_content},
+            ])
             composed = json.loads(raw)
             text = (composed.get("text") or "").strip()
             speech = (composed.get("speech_text") or "").strip()
@@ -646,14 +644,13 @@ def _write_final_reply(user_message, execution_summary, language):
             return text, (speech or to_urdu_script(text) or None)
 
         # language == "ur"
-        raw = call_groq(
+        raw = call_gemini_reasoning(
             messages=[
                 {"role": "system", "content": prompt.RESPONSE_WRITER_UR},
                 {"role": "user", "content": user_content},
             ],
-            reasoning=True,
             response_format_json=False,
-        )
+            )
         composed = (raw or "").strip()
         if not composed or not has_urdu_script(composed):
             logger.warning("response writer (ur) returned unusable text; using execution summary")

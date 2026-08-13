@@ -1,7 +1,7 @@
 import json
 import logging
 
-from apps.chat.groq_client import call_groq
+from apps.chat.google_client import call_gemini_reasoning, call_gemma_planner
 from apps.chat.prompt import LANGUAGE_NAMES, OUTPUT_CONTRACT_INSTRUCTIONS, wrap_untrusted
 from apps.chat.serializers import AiReplySerializer
 
@@ -15,8 +15,12 @@ SAFE_EXTRACTED_FIELDS = ("date", "amount", "customer_name")
 
 
 def build_clarification_reply(business, extracted_data, missing_fields, candidates=None):
-    """Groq 8B first attempt; escalate to 70B only if the clarification itself is ambiguous
-    (heuristic: more than one field missing counts as ambiguous enough to warrant it).
+    """Gemma (fast tier) first attempt; escalate to Gemini's quality tier only if the
+    clarification itself is ambiguous (heuristic: more than one field missing counts
+    as ambiguous enough to warrant it). Was Groq 8B/70B — moved onto the same two
+    Google-backed tiers apps.chat.services now uses everywhere else, so this call
+    site also gets key rotation + quota cooldown for free via
+    apps.integrations.google_genai_client.
 
     `candidates` are customers that matched the photographed name closely but
     not decisively — naming them turns "I couldn't identify the customer" into a
@@ -50,7 +54,10 @@ def build_clarification_reply(business, extracted_data, missing_fields, candidat
     reasoning = len(missing_fields) > 1
 
     try:
-        raw = call_groq(messages=messages, reasoning=reasoning)
+        if reasoning:
+            raw = call_gemini_reasoning(messages=messages)
+        else:
+            raw = call_gemma_planner(messages=messages)
         data = json.loads(raw)
         serializer = AiReplySerializer(data=data)
         serializer.is_valid(raise_exception=True)
